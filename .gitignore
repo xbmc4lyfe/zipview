@@ -1,0 +1,7 @@
+/target
+/fuzz/target
+# The live corpus and crash artifacts are run output, not source.
+/fuzz/corpus
+/fuzz/artifacts
+# fuzz/seeds IS checked in: it is the starting corpus, small, and the fuzz
+# target is near-useless without it. Regenerate with fuzz/gen_seeds.py.

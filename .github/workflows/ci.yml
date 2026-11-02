@@ -1,0 +1,87 @@
+name: CI
+
+# GitHub-hosted runners throughout, deliberately. The project this crate was
+# extracted from had its CI silently dead for three and a half weeks because
+# self-hosted runners stopped answering: a job waiting for a runner that will
+# never arrive reports "queued", not "failed", so nothing ever went red.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # Weekly, so a new advisory against flate2 surfaces without waiting for a
+    # commit. The crate exists to keep its dependency surface near zero; that
+    # claim needs checking on a clock, not on activity.
+    - cron: '0 6 * * 1'
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --all-targets
+      - run: cargo test --doc
+
+  # The crate's central claim is one dependency and nothing worth auditing.
+  # This is the job that holds it to that.
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: rustsec/audit-check@e9159ac5f7d7d873ce074ca134da2f445c0a4a61 # v1.3.2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  # Builds the fuzz target and runs it briefly. Not a substitute for a long
+  # campaign, but it catches the indexing mistake a new parsing path introduces,
+  # which is the failure this crate cannot afford.
+  fuzz:
+    name: Fuzz (smoke)
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@4cda84d5c5c54efe2404f9d843567869ab1699d4 # nightly
+        with:
+          toolchain: nightly
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          cache-on-failure: true
+          workspaces: ". -> target\nfuzz -> fuzz/target"
+      - run: cargo install cargo-fuzz --locked
+      # Seeds are load-bearing, not decoration. Unseeded, random bytes almost
+      # never contain a valid end-of-central-directory signature, so the
+      # fuzzer bails at the first check and never reaches the parser: a
+      # measured 181-second unseeded run did 437,933 executions at 30 edges
+      # covered, nearly all of them "not a zip, return".
+      - run: python3 fuzz/gen_seeds.py
+      - run: mkdir -p fuzz/corpus/fuzz_zip
+      - run: cargo run --example seedcheck
+      - run: cargo fuzz run fuzz_zip fuzz/corpus/fuzz_zip fuzz/seeds -- -max_total_time=120 -rss_limit_mb=4096
+      - name: Upload crash artifacts
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: fuzz-artifacts
+          path: fuzz/artifacts/
+          retention-days: 30

@@ -1,0 +1,24 @@
+[package]
+name = "zipview"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+authors = ["zipview contributors"]
+license = "GPL-3.0"
+description = "Read-only, allocation-bounded ZIP container reader. No extraction, no writing, no filesystem access."
+repository = "https://github.com/xbmc4lyfe/zipview"
+keywords = ["zip", "archive", "read-only", "metadata", "parser"]
+categories = ["parser-implementations", "compression"]
+
+[dependencies]
+# The only dependency. ZIP's Deflate payloads are raw deflate streams, and
+# reimplementing inflate would be a genuinely bad trade: it is the one part of
+# this crate where a subtle bug is both likely and hard to find.
+flate2 = "1.1"
+
+[dev-dependencies]
+# None. Test fixtures are built by tests/writer.rs, which writes archives byte
+# by byte -- see README, "Why no dev-dependencies".
+
+[profile.release]
+panic = "abort"
