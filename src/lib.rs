@@ -163,6 +163,10 @@ pub enum ZipReadError {
     DecompressionFailed,
     /// The entry's declared size exceeds [`MAX_INFLATED_SIZE`].
     EntryTooLarge(u64),
+    /// The entry is encrypted and no password was provided.
+    Encrypted,
+    /// The provided password was rejected by the entry's password verifier.
+    BadPassword,
 }
 
 impl std::fmt::Display for ZipReadError {
@@ -178,6 +182,8 @@ impl std::fmt::Display for ZipReadError {
             }
             Self::DecompressionFailed => write!(f, "ZIP entry decompression failed"),
             Self::EntryTooLarge(n) => write!(f, "ZIP entry declares {n} bytes, over the limit"),
+            Self::Encrypted => write!(f, "ZIP entry is encrypted"),
+            Self::BadPassword => write!(f, "ZIP entry password is incorrect"),
         }
     }
 }
@@ -249,6 +255,7 @@ pub struct ZipEntry {
     version_made_by: u16,
     flags: u16,
     last_modified: Option<DosDateTime>,
+    aes_info: Option<(u8, u16)>,
 }
 
 impl ZipEntry {
@@ -259,9 +266,28 @@ impl ZipEntry {
     pub fn name(&self) -> &str {
         &self.name
     }
-    /// Raw compression method code, e.g. 0 Stored, 8 Deflate, 93 Zstd.
+    /// Raw compression method code, e.g. 0 Stored, 8 Deflate, 93 Zstd, 99 AES.
     pub fn compression(&self) -> u16 {
         self.compression
+    }
+    /// Raw general-purpose bit flags from the header.
+    pub fn flags(&self) -> u16 {
+        self.flags
+    }
+    /// Local header offset as stored in the central directory.
+    pub fn local_header_offset(&self) -> u64 {
+        self.local_header_offset
+    }
+    /// WinZip AES extra field (`0x9901`) parameters `(strength, actual_method)`, if present.
+    pub fn aes_info(&self) -> Option<(u8, u16)> {
+        self.aes_info
+    }
+    /// Underlying compression method after unwrapping WinZip AES (method 99), if applicable.
+    pub fn effective_compression(&self) -> u16 {
+        match (self.compression, self.aes_info) {
+            (99, Some((_, actual))) => actual,
+            (m, _) => m,
+        }
     }
     /// CRC-32 of the uncompressed data, as declared. Not verified on read.
     pub fn crc32(&self) -> u32 {
@@ -300,9 +326,9 @@ impl ZipEntry {
         }
     }
 
-    /// True when bit 0 of the general purpose flags is set.
+    /// True when general purpose encryption flags are set or compression method is 99 (WinZip AES).
     pub fn is_encrypted(&self) -> bool {
-        self.flags & 1 != 0
+        self.flags & (0x0001 | 0x0040 | 0x2000) != 0 || self.compression == 99
     }
 
     /// Directory entries are conventionally marked by a trailing separator.
@@ -602,6 +628,8 @@ impl<'a> ZipReader<'a> {
             }
         }
 
+        let aes_info = aes_extra(extra);
+
         let next = extra_start
             .checked_add(extra_len)
             .and_then(|v| v.checked_add(comment_len))
@@ -619,6 +647,7 @@ impl<'a> ZipReader<'a> {
                 version_made_by,
                 flags,
                 last_modified: DosDateTime::from_parts(mod_date, mod_time),
+                aes_info,
             },
             next,
         ))
@@ -670,6 +699,16 @@ impl<'a> ZipReader<'a> {
         self.read_entry(entry)
     }
 
+    /// Decompresses the entry named `name`, decrypting with `password` when encrypted.
+    pub fn read_by_name_with_password(
+        &self,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<Vec<u8>> {
+        let entry = self.by_name(name).ok_or(ZipReadError::EntryNotFound)?;
+        self.read_entry_with_password(entry, password)
+    }
+
     /// Decompresses `name` and decodes it as UTF-8, lossily.
     ///
     /// Lossy because the alternative is failing a whole document over one bad
@@ -679,12 +718,58 @@ impl<'a> ZipReader<'a> {
         Ok(String::from_utf8_lossy(&self.read_by_name(name)?).into_owned())
     }
 
+    /// Decompresses `name` (decrypting with `password` if encrypted) and decodes it as UTF-8, lossily.
+    pub fn read_to_string_with_password(
+        &self,
+        name: &str,
+        password: Option<&str>,
+    ) -> Result<String> {
+        Ok(String::from_utf8_lossy(&self.read_by_name_with_password(name, password)?).into_owned())
+    }
+
+    /// Extracts the [`PasswordCheck`] for `entry` from its local header and payload prefix, if encrypted.
+    pub fn password_check(&self, entry: &ZipEntry) -> Option<PasswordCheck> {
+        if !entry.is_encrypted() {
+            return None;
+        }
+        let local = offset_to_index(
+            entry.local_header_offset.saturating_add(self.offset_shift),
+            self.data,
+        )
+        .ok()?;
+        if u32_at(self.data, local).ok()? != LOCAL_HEADER_SIG {
+            return None;
+        }
+        let local_name_len = u16_at(self.data, local + 26).ok()? as usize;
+        let local_extra_len = u16_at(self.data, local + 28).ok()? as usize;
+        let extra_start = local.checked_add(LOCAL_HEADER_LEN)?.checked_add(local_name_len)?;
+        let data_start = extra_start.checked_add(local_extra_len)?;
+        let local_extra = self.data.get(extra_start..data_start)?;
+        let entry_slice = self.data.get(local..)?;
+        password_check_at(
+            entry_slice,
+            usize::from(entry.flags),
+            usize::from(entry.compression),
+            local_extra,
+            data_start - local,
+        )
+    }
+
     /// Decompresses one entry's payload.
     ///
     /// Sizes come from the central directory, never the local header: a
     /// streamed entry stores zeros there and writes the real values to a data
     /// descriptor after the payload.
     pub fn read_entry(&self, entry: &ZipEntry) -> Result<Vec<u8>> {
+        self.read_entry_with_password(entry, None)
+    }
+
+    /// Decompresses one entry's payload, decrypting with `password` when encrypted.
+    pub fn read_entry_with_password(
+        &self,
+        entry: &ZipEntry,
+        password: Option<&str>,
+    ) -> Result<Vec<u8>> {
         if entry.uncompressed_size > MAX_INFLATED_SIZE {
             return Err(ZipReadError::EntryTooLarge(entry.uncompressed_size));
         }
@@ -701,11 +786,17 @@ impl<'a> ZipReader<'a> {
         let local_name_len = u16_at(self.data, local + 26)? as usize;
         let local_extra_len = u16_at(self.data, local + 28)? as usize;
 
-        let data_start = local
+        let extra_start = local
             .checked_add(LOCAL_HEADER_LEN)
             .and_then(|v| v.checked_add(local_name_len))
-            .and_then(|v| v.checked_add(local_extra_len))
             .ok_or(ZipReadError::BadOffset)?;
+        let data_start = extra_start
+            .checked_add(local_extra_len)
+            .ok_or(ZipReadError::BadOffset)?;
+        let local_extra = self
+            .data
+            .get(extra_start..data_start)
+            .ok_or(ZipReadError::Truncated)?;
 
         let compressed_len =
             usize::try_from(entry.compressed_size).map_err(|_| ZipReadError::BadOffset)?;
@@ -717,12 +808,528 @@ impl<'a> ZipReader<'a> {
             .get(data_start..data_end)
             .ok_or(ZipReadError::Truncated)?;
 
-        match entry.compression {
-            0 => Ok(payload.to_vec()),
-            8 => inflate(payload, entry.uncompressed_size),
+        let (decrypted_buf, method);
+        let payload_bytes: &[u8] = if entry.is_encrypted() {
+            let pw = password.filter(|s| !s.is_empty()).ok_or(ZipReadError::Encrypted)?;
+            if entry.compression == 99 {
+                let (strength, actual_method) = entry
+                    .aes_info
+                    .or_else(|| aes_extra(local_extra))
+                    .ok_or(ZipReadError::UnsupportedCompression(99))?;
+                decrypted_buf =
+                    decrypt_winzip_aes(pw, strength, payload, Some(entry.compressed_size))
+                        .ok_or(ZipReadError::BadPassword)?;
+                method = actual_method;
+            } else {
+                let check = if entry.flags & 0x0008 != 0 {
+                    *self.data.get(local + 11).ok_or(ZipReadError::Truncated)?
+                } else {
+                    (entry.crc32 >> 24) as u8
+                };
+                decrypted_buf =
+                    decrypt_zipcrypto(pw, check, payload).ok_or(ZipReadError::BadPassword)?;
+                method = entry.compression;
+            }
+            &decrypted_buf
+        } else {
+            method = entry.compression;
+            payload
+        };
+
+        match method {
+            0 => {
+                if payload_bytes.len() as u64 != entry.uncompressed_size {
+                    return Err(ZipReadError::DecompressionFailed);
+                }
+                Ok(payload_bytes.to_vec())
+            }
+            8 => inflate(payload_bytes, entry.uncompressed_size),
             other => Err(ZipReadError::UnsupportedCompression(other)),
         }
     }
+}
+
+/// What a ZIP keeps at the start of an encrypted file's data to test a password.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PasswordCheck {
+    /// 12-byte ZipCrypto encryption header whose decrypted 12th byte must equal `check`.
+    Crypto {
+        /// The 12-byte encryption header preceding the compressed stream.
+        header: [u8; 12],
+        /// Expected 12th byte after decryption (high byte of CRC-32 or DOS mod time).
+        check: u8,
+    },
+    /// WinZip AES (`0x9901`): `salt` is `strength * 4 + 4` bytes, followed by a 2-byte PBKDF2 verifier.
+    Aes {
+        /// Key strength: 1 (AES-128), 2 (AES-192), or 3 (AES-256).
+        strength: u8,
+        /// Up to 16 bytes of salt (`8`, `12`, or `16` bytes used according to `strength`).
+        salt: [u8; 16],
+        /// 2-byte password verification value from PBKDF2-HMAC-SHA1.
+        verifier: [u8; 2],
+    },
+}
+
+impl PasswordCheck {
+    /// Serializes this password check to a compact byte representation.
+    pub fn to_bytes(self) -> Vec<u8> {
+        match self {
+            Self::Crypto { header, check } => {
+                let mut out = vec![0, check];
+                out.extend_from_slice(&header);
+                out
+            }
+            Self::Aes {
+                strength,
+                salt,
+                verifier,
+            } => {
+                let mut out = vec![strength];
+                out.extend_from_slice(&salt);
+                out.extend_from_slice(&verifier);
+                out
+            }
+        }
+    }
+
+    /// Deserializes a [`PasswordCheck`] produced by [`Self::to_bytes`].
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        match *b.first()? {
+            0 => Some(Self::Crypto {
+                check: *b.get(1)?,
+                header: b.get(2..14)?.try_into().ok()?,
+            }),
+            strength if (1..=3).contains(&strength) => Some(Self::Aes {
+                strength,
+                salt: b.get(1..17)?.try_into().ok()?,
+                verifier: b.get(17..19)?.try_into().ok()?,
+            }),
+            _ => None,
+        }
+    }
+
+    /// True if `password` satisfies the encryption header check.
+    pub fn accepts(&self, password: &str) -> bool {
+        match self {
+            Self::Crypto { header, check } => crypto_check(password.as_bytes(), header) == *check,
+            Self::Aes {
+                strength,
+                salt,
+                verifier,
+            } => {
+                let salt_len = usize::from(*strength) * 4 + 4;
+                let key_len = (usize::from(*strength) + 1) * 8;
+                salt.get(..salt_len)
+                    .and_then(|s| aes_verifier(password.as_bytes(), s, key_len))
+                    .is_some_and(|found| found == *verifier)
+            }
+        }
+    }
+
+    /// True when the check is at least 16 bits wide (WinZip AES) rather than ZipCrypto's 1-in-256 byte check.
+    pub fn certain(&self) -> bool {
+        matches!(self, Self::Aes { .. })
+    }
+}
+
+/// Parses the ZIP64 extended information extra field (`0x0001`) for saturated 32-bit sizes.
+/// Returns `(uncompressed_size, compressed_size)`.
+pub fn zip64_sizes(extra: &[u8], uncompressed: u32, compressed: u32) -> (u64, u64) {
+    let (mut unp, mut packed) = (u64::from(uncompressed), u64::from(compressed));
+    if let Some(z64) = find_extra_field(extra, 0x0001) {
+        let mut at = 0usize;
+        if uncompressed == u32::MAX {
+            if let Ok(v) = u64_at(z64, at) {
+                unp = v;
+            }
+            at += 8;
+        }
+        if compressed == u32::MAX {
+            if let Ok(v) = u64_at(z64, at) {
+                packed = v;
+            }
+        }
+    }
+    (unp, packed)
+}
+
+/// Parses WinZip AES extra field `0x9901`, returning `(strength, actual_method)`.
+pub fn aes_extra(extra: &[u8]) -> Option<(u8, u16)> {
+    let body = find_extra_field(extra, 0x9901)?;
+    if body.len() < 7 {
+        return None;
+    }
+    let strength = body.get(4).copied().filter(|s| (1..=3).contains(s))?;
+    let method = u16::from_le_bytes([*body.get(5)?, *body.get(6)?]);
+    Some((strength, method))
+}
+
+/// Extracts a [`PasswordCheck`] from a local entry slice starting at its `PK\x03\x04` signature.
+pub fn password_check_at(
+    entry: &[u8],
+    flags: usize,
+    method: usize,
+    extra: &[u8],
+    data_at: usize,
+) -> Option<PasswordCheck> {
+    let data = entry.get(data_at..)?;
+    if method == 99 {
+        let (strength, _) = aes_extra(extra)?;
+        let salt_len = usize::from(strength) * 4 + 4;
+        let mut salt = [0u8; 16];
+        salt.get_mut(..salt_len)?
+            .copy_from_slice(data.get(..salt_len)?);
+        Some(PasswordCheck::Aes {
+            strength,
+            salt,
+            verifier: data.get(salt_len..salt_len + 2)?.try_into().ok()?,
+        })
+    } else {
+        let check = if flags & 0x0008 != 0 {
+            *entry.get(11)?
+        } else {
+            *entry.get(17)?
+        };
+        Some(PasswordCheck::Crypto {
+            header: data.get(..12)?.try_into().ok()?,
+            check,
+        })
+    }
+}
+
+fn crypto_check(password: &[u8], header: &[u8; 12]) -> u8 {
+    let mut keys = crypto_keys(password);
+    let mut last = 0;
+    for cipher in header {
+        last = crypto_step(&mut keys, *cipher);
+    }
+    last
+}
+
+fn crypto_keys(password: &[u8]) -> [u32; 3] {
+    let mut keys = [0x1234_5678u32, 0x2345_6789, 0x3456_7890];
+    for b in password {
+        crypto_update(&mut keys, *b);
+    }
+    keys
+}
+
+fn crypto_update(keys: &mut [u32; 3], b: u8) {
+    fn crc_byte(crc: u32, b: u8) -> u32 {
+        let mut c = (crc ^ u32::from(b)) & 0xff;
+        for _ in 0..8 {
+            c = if c & 1 != 0 {
+                (c >> 1) ^ 0xedb8_8320
+            } else {
+                c >> 1
+            };
+        }
+        (crc >> 8) ^ c
+    }
+    keys[0] = crc_byte(keys[0], b);
+    keys[1] = keys[1]
+        .wrapping_add(keys[0] & 0xff)
+        .wrapping_mul(134_775_813)
+        .wrapping_add(1);
+    keys[2] = crc_byte(keys[2], (keys[1] >> 24) as u8);
+}
+
+fn crypto_step(keys: &mut [u32; 3], cipher: u8) -> u8 {
+    let t = keys[2] | 2;
+    let plain = cipher ^ (t.wrapping_mul(t ^ 1) >> 8) as u8;
+    crypto_update(keys, plain);
+    plain
+}
+
+/// Decrypts a ZipCrypto entry starting at `data` (12-byte encryption header + payload) if `check` matches.
+pub fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Option<Vec<u8>> {
+    let header = data.get(..12)?;
+    let payload = data.get(12..)?;
+    let mut keys = crypto_keys(password.as_bytes());
+    let mut last = 0u8;
+    for b in header {
+        last = crypto_step(&mut keys, *b);
+    }
+    if last != check {
+        return None;
+    }
+    let mut out = Vec::with_capacity(payload.len());
+    for b in payload {
+        out.push(crypto_step(&mut keys, *b));
+    }
+    Some(out)
+}
+
+/// Pure-Rust SHA-1 digest of two slices concatenated (`a || b`).
+fn sha1_pair(a: &[u8], b: &[u8]) -> [u8; 20] {
+    let mut h0 = 0x6745_2301u32;
+    let mut h1 = 0xefcd_ab89u32;
+    let mut h2 = 0x98ba_dcfeu32;
+    let mut h3 = 0x1032_5476u32;
+    let mut h4 = 0xc3d2_e1f0u32;
+
+    let total_len = a.len() + b.len();
+    let bit_len = (total_len as u64) * 8;
+    let mut msg = Vec::with_capacity((total_len + 9).div_ceil(64) * 64);
+    msg.extend_from_slice(a);
+    msg.extend_from_slice(b);
+    msg.push(0x80);
+    while msg.len() % 64 != 56 {
+        msg.push(0);
+    }
+    msg.extend_from_slice(&bit_len.to_be_bytes());
+
+    for chunk in msg.chunks_exact(64) {
+        let mut w = [0u32; 80];
+        for (i, word) in w.iter_mut().take(16).enumerate() {
+            let off = i * 4;
+            *word = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+        }
+        for i in 16..80 {
+            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+        }
+        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+        for (i, &wi) in w.iter().enumerate() {
+            let (f, k) = match i {
+                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999u32),
+                20..=39 => (b ^ c ^ d, 0x6ed9_eba1u32),
+                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc_u32),
+                _ => (b ^ c ^ d, 0xca62_c1d6u32),
+            };
+            let temp = a
+                .rotate_left(5)
+                .wrapping_add(f)
+                .wrapping_add(e)
+                .wrapping_add(k)
+                .wrapping_add(wi);
+            e = d;
+            d = c;
+            c = b.rotate_left(30);
+            b = a;
+            a = temp;
+        }
+        h0 = h0.wrapping_add(a);
+        h1 = h1.wrapping_add(b);
+        h2 = h2.wrapping_add(c);
+        h3 = h3.wrapping_add(d);
+        h4 = h4.wrapping_add(e);
+    }
+
+    let mut out = [0u8; 20];
+    out[0..4].copy_from_slice(&h0.to_be_bytes());
+    out[4..8].copy_from_slice(&h1.to_be_bytes());
+    out[8..12].copy_from_slice(&h2.to_be_bytes());
+    out[12..16].copy_from_slice(&h3.to_be_bytes());
+    out[16..20].copy_from_slice(&h4.to_be_bytes());
+    out
+}
+
+fn hmac_sha1_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
+    let mut k = [0u8; 64];
+    if key.len() > 64 {
+        let digest = sha1_pair(key, &[]);
+        k[..20].copy_from_slice(&digest);
+    } else {
+        k[..key.len()].copy_from_slice(key);
+    }
+    let mut ipad = [0x36u8; 64];
+    let mut opad = [0x5cu8; 64];
+    for i in 0..64 {
+        ipad[i] ^= k[i];
+        opad[i] ^= k[i];
+    }
+    (ipad, opad)
+}
+
+fn hmac_sha1(ipad: &[u8; 64], opad: &[u8; 64], data: &[u8]) -> [u8; 20] {
+    let inner = sha1_pair(ipad, data);
+    sha1_pair(opad, &inner)
+}
+
+/// PBKDF2-HMAC-SHA1 (1000 rounds) as specified by WinZip AES: derives `2 * key_len + 2` bytes.
+pub fn aes_derive(password: &[u8], salt: &[u8], key_len: usize) -> Option<Vec<u8>> {
+    let (ipad, opad) = hmac_sha1_pads(password);
+    let wanted = key_len * 2 + 2;
+    let mut derived = Vec::with_capacity(wanted + 20);
+    let mut block = 1u32;
+    let mut salt_block = Vec::with_capacity(salt.len() + 4);
+    while derived.len() < wanted {
+        salt_block.clear();
+        salt_block.extend_from_slice(salt);
+        salt_block.extend_from_slice(&block.to_be_bytes());
+        let mut u = hmac_sha1(&ipad, &opad, &salt_block);
+        let mut out = u;
+        for _ in 1..1000 {
+            u = hmac_sha1(&ipad, &opad, &u);
+            for (slot, b) in out.iter_mut().zip(u) {
+                *slot ^= b;
+            }
+        }
+        derived.extend_from_slice(&out);
+        block += 1;
+    }
+    derived.truncate(wanted);
+    Some(derived)
+}
+
+fn aes_verifier(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 2]> {
+    let derived = aes_derive(password, salt, key_len)?;
+    let wanted = key_len * 2 + 2;
+    derived.get(wanted - 2..wanted)?.try_into().ok()
+}
+
+/// Decrypts a WinZip AES (method 99) entry starting at `data` (`salt + verifier + ciphertext [+ 10-byte auth]`).
+pub fn decrypt_winzip_aes(
+    password: &str,
+    strength: u8,
+    data: &[u8],
+    full_packed: Option<u64>,
+) -> Option<Vec<u8>> {
+    if !(1..=3).contains(&strength) {
+        return None;
+    }
+    let salt_len = usize::from(strength) * 4 + 4;
+    let key_len = (usize::from(strength) + 1) * 8;
+    let salt = data.get(..salt_len)?;
+    let verifier = data.get(salt_len..salt_len + 2)?;
+    let derived = aes_derive(password.as_bytes(), salt, key_len)?;
+    if derived.get(key_len * 2..key_len * 2 + 2) != Some(verifier) {
+        return None;
+    }
+    let key = derived.get(..key_len)?;
+    let ct_end = match full_packed.and_then(|p| usize::try_from(p).ok()) {
+        Some(p) if p >= salt_len + 12 => data.len().min(p - 10),
+        _ => data.len(),
+    };
+    let ct = data.get(salt_len + 2..ct_end)?;
+    decrypt_winzip_ctr(key, ct)
+}
+
+const SBOX: [u8; 256] = [
+    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
+    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
+    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
+    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
+    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
+    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
+    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
+    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
+    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
+    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
+    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
+    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
+    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
+    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
+    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
+    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
+];
+
+const RCON: [u32; 10] = [
+    0x0100_0000, 0x0200_0000, 0x0400_0000, 0x0800_0000, 0x1000_0000,
+    0x2000_0000, 0x4000_0000, 0x8000_0000, 0x1b00_0000, 0x3600_0000,
+];
+
+fn sub_word(w: u32) -> u32 {
+    let [b0, b1, b2, b3] = w.to_be_bytes();
+    u32::from_be_bytes([
+        SBOX[usize::from(b0)],
+        SBOX[usize::from(b1)],
+        SBOX[usize::from(b2)],
+        SBOX[usize::from(b3)],
+    ])
+}
+
+#[inline]
+fn xtime(x: u8) -> u8 {
+    (x << 1) ^ if x & 0x80 != 0 { 0x1b } else { 0 }
+}
+
+fn aes_expand_key(key: &[u8]) -> Option<([[u8; 16]; 15], usize)> {
+    let (nk, nr) = match key.len() {
+        16 => (4usize, 10usize),
+        24 => (6usize, 12usize),
+        32 => (8usize, 14usize),
+        _ => return None,
+    };
+    let total_words = 4 * (nr + 1);
+    let mut w = [0u32; 60];
+    for (i, chunk) in key.chunks_exact(4).enumerate() {
+        w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+    }
+    for i in nk..total_words {
+        let mut temp = w[i - 1];
+        if i % nk == 0 {
+            temp = sub_word(temp.rotate_left(8)) ^ RCON[i / nk - 1];
+        } else if nk > 6 && i % nk == 4 {
+            temp = sub_word(temp);
+        }
+        w[i] = w[i - nk] ^ temp;
+    }
+    let mut rk = [[0u8; 16]; 15];
+    for r in 0..=nr {
+        for c in 0..4 {
+            rk[r][c * 4..c * 4 + 4].copy_from_slice(&w[r * 4 + c].to_be_bytes());
+        }
+    }
+    Some((rk, nr))
+}
+
+fn aes_encrypt_block(rk: &[[u8; 16]; 15], nr: usize, block: &[u8; 16]) -> [u8; 16] {
+    let mut s = *block;
+    for (b, &k) in s.iter_mut().zip(&rk[0]) {
+        *b ^= k;
+    }
+    for round_key in rk.iter().take(nr).skip(1) {
+        for b in &mut s {
+            *b = SBOX[usize::from(*b)];
+        }
+        s = [
+            s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3],
+            s[8], s[13], s[2], s[7], s[12], s[1], s[6], s[11],
+        ];
+        for col in s.chunks_exact_mut(4) {
+            let (s0, s1, s2, s3) = (col[0], col[1], col[2], col[3]);
+            let t = s0 ^ s1 ^ s2 ^ s3;
+            col[0] ^= t ^ xtime(s0 ^ s1);
+            col[1] ^= t ^ xtime(s1 ^ s2);
+            col[2] ^= t ^ xtime(s2 ^ s3);
+            col[3] ^= t ^ xtime(s3 ^ s0);
+        }
+        for (b, &k) in s.iter_mut().zip(round_key) {
+            *b ^= k;
+        }
+    }
+    for b in &mut s {
+        *b = SBOX[usize::from(*b)];
+    }
+    s = [
+        s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3],
+        s[8], s[13], s[2], s[7], s[12], s[1], s[6], s[11],
+    ];
+    for (b, &k) in s.iter_mut().zip(&rk[nr]) {
+        *b ^= k;
+    }
+    s
+}
+
+/// Decrypts WinZip AES CTR-mode ciphertext (little-endian counter starting at 1).
+pub fn decrypt_winzip_ctr(key: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
+    let (rk, nr) = aes_expand_key(key)?;
+    let mut out = Vec::with_capacity(ciphertext.len());
+    let mut counter = [0u8; 16];
+    for chunk in ciphertext.chunks(16) {
+        for b in &mut counter {
+            *b = b.wrapping_add(1);
+            if *b != 0 {
+                break;
+            }
+        }
+        let ks = aes_encrypt_block(&rk, nr, &counter);
+        for (&c, &k) in chunk.iter().zip(&ks) {
+            out.push(c ^ k);
+        }
+    }
+    Some(out)
 }
 
 /// Finds an extra-field record by header id within an extra-field block.
@@ -966,5 +1573,54 @@ mod tests {
         // Must stop at the first non-signature rather than trusting the count.
         let r = ZipReader::new(&zip).expect("parse");
         assert_eq!(r.len(), 1);
+    }
+
+    #[test]
+    fn zipcrypto_and_winzip_aes_password_check_and_decryption() {
+        let hex = "504b03040a00090000005385615d8088f9e51d0000001100000005001c00612e74787455540900035dc0e76a5dc0e76a75780b000104f50100000400000000f7ab9852cf9d136c418bc8d76355e788c188185d9bab38a1e11ee61944";
+        let data: Vec<u8> = (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect();
+        let check = password_check_at(&data, 9, 0, &data[35..63], 63).expect("password check");
+        assert!(check.accepts("secret"));
+        assert!(!check.accepts("wrong"));
+        assert!(!check.certain());
+        assert_eq!(PasswordCheck::from_bytes(&check.to_bytes()), Some(check));
+        let plain = decrypt_zipcrypto("secret", 0x85, &data[63..]).expect("decrypt zipcrypto");
+        assert_eq!(plain, b"hello hello hello");
+
+        let mut salt = [0u8; 16];
+        for (i, b) in salt.iter_mut().enumerate() {
+            *b = i as u8;
+        }
+        let aes_check = PasswordCheck::Aes {
+            strength: 3,
+            salt,
+            verifier: [0xa3, 0x36],
+        };
+        assert!(aes_check.accepts("secret"));
+        assert!(!aes_check.accepts("wrong"));
+        assert!(aes_check.certain());
+        assert_eq!(
+            PasswordCheck::from_bytes(&aes_check.to_bytes()),
+            Some(aes_check)
+        );
+
+        let derived = aes_derive(b"secret", &salt, 32).expect("derive");
+        let ct = decrypt_winzip_ctr(&derived[..32], b"winzip aes payload").expect("ctr encrypt");
+        let mut aes_payload = Vec::new();
+        aes_payload.extend_from_slice(&salt);
+        aes_payload.extend_from_slice(&[0xa3, 0x36]);
+        aes_payload.extend_from_slice(&ct);
+        aes_payload.extend_from_slice(&[0u8; 10]);
+        let dec = decrypt_winzip_aes(
+            "secret",
+            3,
+            &aes_payload,
+            Some(aes_payload.len() as u64),
+        )
+        .expect("decrypt winzip aes");
+        assert_eq!(dec, b"winzip aes payload");
     }
 }
