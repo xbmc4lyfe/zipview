@@ -1559,21 +1559,27 @@ fn find_extra_field(extra: &[u8], want_id: u16) -> Option<&[u8]> {
 /// tags, and AGENTS.md is explicit that a plausible wrong value is worse than
 /// an absent one.
 fn inflate(payload: &[u8], declared_size: u64) -> Result<Vec<u8>> {
-    use std::io::Read;
+    use flate2::{Decompress, FlushDecompress, Status};
 
-    let cap = usize::try_from(declared_size).map_err(|_| ZipReadError::BadOffset)?;
+    // One byte of room past the declared size, so a stream that runs long
+    // fills it and is caught rather than silently cut to the declared size.
+    let room = usize::try_from(declared_size)
+        .ok()
+        .and_then(|n| n.checked_add(1))
+        .ok_or(ZipReadError::BadOffset)?;
     let mut out = Vec::new();
-    out.try_reserve_exact(cap)
+    out.try_reserve_exact(room)
         .map_err(|_| ZipReadError::EntryTooLarge(declared_size))?;
 
-    // take(cap + 1) so an over-long stream is detected rather than silently
-    // truncated to the declared size.
-    let mut decoder = flate2::read::DeflateDecoder::new(payload).take(declared_size + 1);
-    decoder
-        .read_to_end(&mut out)
+    // The whole stream in one call with `Finish`: the inflater then writes
+    // straight into `out`, using it as its history, instead of inflating
+    // through its own 32 KiB window and copying each piece out, as a reader
+    // does.
+    let status = Decompress::new(false)
+        .decompress_vec(payload, &mut out, FlushDecompress::Finish)
         .map_err(|_| ZipReadError::DecompressionFailed)?;
 
-    if out.len() as u64 != declared_size {
+    if status != Status::StreamEnd || out.len() as u64 != declared_size {
         return Err(ZipReadError::DecompressionFailed);
     }
     Ok(out)
@@ -2136,6 +2142,46 @@ mod tests {
             }
         }
         assert!(decrypt_winzip_ctr(&[0; 20], b"x").is_none());
+    }
+
+    #[test]
+    fn inflate_holds_streams_to_their_declared_size() {
+        use std::io::Write;
+        fn deflate(body: &[u8]) -> Vec<u8> {
+            let mut e =
+                flate2::write::DeflateEncoder::new(Vec::new(), flate2::Compression::default());
+            e.write_all(body).unwrap();
+            e.finish().unwrap()
+        }
+        let failed = |r: Result<Vec<u8>>| matches!(r, Err(ZipReadError::DecompressionFailed));
+        for body in [
+            Vec::new(),
+            b"x".to_vec(),
+            b"metadata ".repeat(10_000),
+            (0..300_000u32)
+                .map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8)
+                .collect(),
+        ] {
+            let stream = deflate(&body);
+            let n = body.len() as u64;
+            assert_eq!(inflate(&stream, n).unwrap(), body);
+            // Bytes after the end of the stream are not the stream's business.
+            let mut trailing = stream.clone();
+            trailing.extend_from_slice(b"junk");
+            assert_eq!(inflate(&trailing, n).unwrap(), body);
+            // A stream longer or shorter than declared, or cut short, is an error.
+            if n > 0 {
+                assert!(failed(inflate(&stream, n - 1)));
+            }
+            assert!(failed(inflate(&stream, n + 1)));
+            for cut in [1, 2, stream.len() / 2] {
+                assert!(
+                    failed(inflate(&stream[..stream.len() - cut], n)),
+                    "cut {cut}"
+                );
+            }
+        }
+        assert!(failed(inflate(b"\xff\xff\xff\xff", 10)));
     }
 
     #[test]
