@@ -53,7 +53,8 @@
 //!
 //! Every field is read through bounds-checked helpers, so a truncated or
 //! hostile archive yields `Err`, never a panic or an out-of-bounds read.
-//! There is no `unsafe` in this crate.
+//! There is no `unsafe` in this crate. Inflation is done by `flate2` on its
+//! `zlib-rs` backend, which does use `unsafe` internally, for speed.
 //!
 //! - The central directory is the single source of truth for sizes and
 //!   offsets. Local headers are checked only for their signature; their size
