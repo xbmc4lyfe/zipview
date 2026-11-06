@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! The processor's own AES instructions, where it has them.
+//! The processor's own AES and SHA-1 instructions, where it has them.
 //!
 //! This is the crate's only `unsafe`: calling an instruction the compiler
 //! cannot assume the processor has, and reading and writing whole 16-byte
@@ -200,5 +200,133 @@ mod imp {
 mod imp {
     pub(super) fn aes_ctr_xor(_: &[u32; 60], _: usize, _: &mut [u8]) -> bool {
         false
+    }
+}
+
+/// The rest of a PBKDF2-HMAC-SHA1 block after its first MAC `u`: the XOR of
+/// `u` and the `iterations - 1` MACs chained from it, each the HMAC of the
+/// one before under the key whose compressed pads are `inner` and `outer`.
+/// Runs on the processor's SHA-1 instructions; `None` when it has none.
+pub(crate) fn pbkdf2_sha1_rest(
+    inner: [u32; 5],
+    outer: [u32; 5],
+    u: [u32; 5],
+    iterations: u32,
+) -> Option<[u32; 5]> {
+    sha::pbkdf2_rest(inner, outer, u, iterations)
+}
+
+#[cfg(target_arch = "aarch64")]
+mod sha {
+    use std::arch::aarch64::*;
+
+    pub(super) fn pbkdf2_rest(
+        inner: [u32; 5],
+        outer: [u32; 5],
+        u: [u32; 5],
+        iterations: u32,
+    ) -> Option<[u32; 5]> {
+        // The SHA-1 instructions come under the `sha2` feature.
+        if !std::arch::is_aarch64_feature_detected!("sha2") {
+            return None;
+        }
+        // SAFETY: the processor has the SHA-1 instructions (checked above),
+        // and NEON is part of every 64-bit ARM processor
+        Some(unsafe { rest(inner, outer, u, iterations) })
+    }
+
+    #[target_feature(enable = "neon,sha2")]
+    fn words(w: [u32; 4]) -> uint32x4_t {
+        let v = vsetq_lane_u32::<0>(w[0], vdupq_n_u32(0));
+        let v = vsetq_lane_u32::<1>(w[1], v);
+        let v = vsetq_lane_u32::<2>(w[2], v);
+        vsetq_lane_u32::<3>(w[3], v)
+    }
+
+    /// One SHA-1 compression of the block `w` (four vectors of four words)
+    /// into the state `abcd`, `e`. `SHA1C`, `SHA1P` and `SHA1M` each do four
+    /// rounds with their round function, `SHA1H` gives the `e` for the next
+    /// four, and `SHA1SU0`/`SHA1SU1` extend the message schedule four words
+    /// at a time.
+    #[target_feature(enable = "neon,sha2")]
+    #[inline]
+    fn compress(abcd0: uint32x4_t, e0: u32, mut w: [uint32x4_t; 4]) -> (uint32x4_t, u32) {
+        let (mut abcd, mut e) = (abcd0, e0);
+        // Four rounds on schedule vector `$i`, with the round function `$op`.
+        macro_rules! rounds {
+            ($i:expr, $op:ident, $k:expr) => {
+                let wk = vaddq_u32(w[$i % 4], vdupq_n_u32($k));
+                let next_e = vsha1h_u32(vgetq_lane_u32::<0>(abcd));
+                abcd = $op(abcd, e, wk);
+                e = next_e;
+            };
+        }
+        // The same, then schedule vector `$i + 4` in the slot `$i` used.
+        macro_rules! rounds_and_schedule {
+            ($i:expr, $op:ident, $k:expr) => {
+                rounds!($i, $op, $k);
+                w[$i % 4] = vsha1su1q_u32(
+                    vsha1su0q_u32(w[$i % 4], w[($i + 1) % 4], w[($i + 2) % 4]),
+                    w[($i + 3) % 4],
+                );
+            };
+        }
+        rounds_and_schedule!(0, vsha1cq_u32, 0x5a82_7999);
+        rounds_and_schedule!(1, vsha1cq_u32, 0x5a82_7999);
+        rounds_and_schedule!(2, vsha1cq_u32, 0x5a82_7999);
+        rounds_and_schedule!(3, vsha1cq_u32, 0x5a82_7999);
+        rounds_and_schedule!(4, vsha1cq_u32, 0x5a82_7999);
+        rounds_and_schedule!(5, vsha1pq_u32, 0x6ed9_eba1);
+        rounds_and_schedule!(6, vsha1pq_u32, 0x6ed9_eba1);
+        rounds_and_schedule!(7, vsha1pq_u32, 0x6ed9_eba1);
+        rounds_and_schedule!(8, vsha1pq_u32, 0x6ed9_eba1);
+        rounds_and_schedule!(9, vsha1pq_u32, 0x6ed9_eba1);
+        rounds_and_schedule!(10, vsha1mq_u32, 0x8f1b_bcdc);
+        rounds_and_schedule!(11, vsha1mq_u32, 0x8f1b_bcdc);
+        rounds_and_schedule!(12, vsha1mq_u32, 0x8f1b_bcdc);
+        rounds_and_schedule!(13, vsha1mq_u32, 0x8f1b_bcdc);
+        rounds_and_schedule!(14, vsha1mq_u32, 0x8f1b_bcdc);
+        rounds_and_schedule!(15, vsha1pq_u32, 0xca62_c1d6);
+        rounds!(16, vsha1pq_u32, 0xca62_c1d6);
+        rounds!(17, vsha1pq_u32, 0xca62_c1d6);
+        rounds!(18, vsha1pq_u32, 0xca62_c1d6);
+        rounds!(19, vsha1pq_u32, 0xca62_c1d6);
+        (vaddq_u32(abcd, abcd0), e.wrapping_add(e0))
+    }
+
+    /// Each iteration hashes a 20-byte digest after a 64-byte key block, so
+    /// its block is the digest, the padding bit, zeros and a length of 84
+    /// bytes: built in registers, with nothing stored.
+    #[target_feature(enable = "neon,sha2")]
+    fn rest(inner: [u32; 5], outer: [u32; 5], u: [u32; 5], iterations: u32) -> [u32; 5] {
+        let zero = vdupq_n_u32(0);
+        let length = vsetq_lane_u32::<3>((64 + 20) * 8, zero);
+        let tail = |e: u32| vsetq_lane_u32::<1>(0x8000_0000, vsetq_lane_u32::<0>(e, zero));
+        let (ia, ie) = (words([inner[0], inner[1], inner[2], inner[3]]), inner[4]);
+        let (oa, oe) = (words([outer[0], outer[1], outer[2], outer[3]]), outer[4]);
+        let (mut ua, mut ue) = (words([u[0], u[1], u[2], u[3]]), u[4]);
+        let (mut sa, mut se) = (ua, ue);
+        for _ in 1..iterations {
+            let (ha, he) = compress(ia, ie, [ua, tail(ue), zero, length]);
+            (ua, ue) = compress(oa, oe, [ha, tail(he), zero, length]);
+            sa = veorq_u32(sa, ua);
+            se ^= ue;
+        }
+        [
+            vgetq_lane_u32::<0>(sa),
+            vgetq_lane_u32::<1>(sa),
+            vgetq_lane_u32::<2>(sa),
+            vgetq_lane_u32::<3>(sa),
+            se,
+        ]
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+mod sha {
+    // x86-64 has SHA instructions too (SHA-NI), but none of the machines this
+    // was measured on has them; the portable code runs there.
+    pub(super) fn pbkdf2_rest(_: [u32; 5], _: [u32; 5], _: [u32; 5], _: u32) -> Option<[u32; 5]> {
+        None
     }
 }

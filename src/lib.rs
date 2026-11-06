@@ -54,7 +54,7 @@
 //! Every field is read through bounds-checked helpers, so a truncated or
 //! hostile archive yields `Err`, never a panic or an out-of-bounds read.
 //! Parsing has no `unsafe`. The only `unsafe` in the crate is in `accel`,
-//! which runs the processor's own AES instructions where it has them, checked
+//! which runs the processor's own AES and SHA-1 instructions where it has them, checked
 //! for at run time, with the portable code as the fallback. Inflation is done
 //! by `flate2` on its `zlib-rs` backend, which also uses `unsafe`, for speed.
 //!
@@ -1225,6 +1225,20 @@ impl HmacSha1 {
         Self::mac_digest(inner, self.outer)
     }
 
+    /// The rest of a PBKDF2 block after its first MAC `u`: the XOR of `u`
+    /// and the `iterations - 1` MACs chained from it. The portable version of
+    /// `accel::pbkdf2_sha1_rest`.
+    fn rest(&self, mut u: [u32; 5], iterations: u32) -> [u32; 5] {
+        let mut sum = u;
+        for _ in 1..iterations {
+            u = self.mac20(u);
+            for (s, x) in sum.iter_mut().zip(u) {
+                *s ^= x;
+            }
+        }
+        sum
+    }
+
     /// `state` finished over a 20-byte digest after one 64-byte key block:
     /// the digest, the padding byte, zeros and a length of 84 bytes.
     #[inline(always)]
@@ -1256,14 +1270,9 @@ fn pbkdf2_sha1(
         message.clear();
         message.extend_from_slice(salt);
         message.extend_from_slice(&u32::try_from(index + 1).ok()?.to_be_bytes());
-        let mut u = mac.mac(&message);
-        let mut sum = u;
-        for _ in 1..iterations {
-            u = mac.mac20(u);
-            for (s, x) in sum.iter_mut().zip(u) {
-                *s ^= x;
-            }
-        }
+        let u = mac.mac(&message);
+        let sum = accel::pbkdf2_sha1_rest(mac.inner, mac.outer, u, iterations)
+            .unwrap_or_else(|| mac.rest(u, iterations));
         let mut block = [0u8; 20];
         for (bytes, word) in block.chunks_exact_mut(4).zip(sum) {
             bytes.copy_from_slice(&word.to_be_bytes());
@@ -1965,6 +1974,28 @@ mod tests {
                 want[start..end],
                 "{start}..{end}"
             );
+        }
+    }
+
+    #[test]
+    fn pbkdf2_iterations_agree_with_and_without_sha1_instructions() {
+        let mut x = 0x9e37_79b9_7f4a_7c15u64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u32
+        };
+        for _ in 0..20 {
+            let key: Vec<u8> = (0..next() % 90).map(|_| next() as u8).collect();
+            let mac = HmacSha1::new(&key);
+            let u = [next(), next(), next(), next(), next()];
+            for iterations in [1, 2, 3, 1000] {
+                let portable = mac.rest(u, iterations);
+                if let Some(fast) = accel::pbkdf2_sha1_rest(mac.inner, mac.outer, u, iterations) {
+                    assert_eq!(fast, portable, "{iterations} iterations");
+                }
+            }
         }
     }
 
