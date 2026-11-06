@@ -322,10 +322,130 @@ mod sha {
     }
 }
 
-#[cfg(not(target_arch = "aarch64"))]
+#[cfg(target_arch = "x86_64")]
 mod sha {
-    // x86-64 has SHA instructions too (SHA-NI), but none of the machines this
-    // was measured on has them; the portable code runs there.
+    use std::arch::x86_64::*;
+
+    pub(super) fn pbkdf2_rest(
+        inner: [u32; 5],
+        outer: [u32; 5],
+        u: [u32; 5],
+        iterations: u32,
+    ) -> Option<[u32; 5]> {
+        if !std::arch::is_x86_feature_detected!("sha") {
+            return None;
+        }
+        // SAFETY: the processor has the SHA extensions (checked above), and
+        // SSE2 is part of every x86-64 processor
+        Some(unsafe { rest(inner, outer, u, iterations) })
+    }
+
+    /// Four words in the instructions' order: the first in the top lane.
+    #[target_feature(enable = "sha,sse2")]
+    fn words(w: [u32; 4]) -> __m128i {
+        _mm_set_epi32(w[0] as i32, w[1] as i32, w[2] as i32, w[3] as i32)
+    }
+
+    /// Lane `N` of `v`, counted from the bottom.
+    #[target_feature(enable = "sha,sse2")]
+    fn lane<const N: i32>(v: __m128i) -> u32 {
+        _mm_cvtsi128_si32(_mm_shuffle_epi32::<N>(v)) as u32
+    }
+
+    /// One SHA-1 compression of the block `w` (four vectors of four words)
+    /// into the state `abcd`, with `e` in the top lane of its own vector.
+    /// `SHA1RNDS4` does four rounds, its immediate picking the round function
+    /// and constant. It takes `e` added to the first of the four words, which
+    /// `SHA1NEXTE` does: the `e` four rounds on is the `a` from before them,
+    /// rotated. `SHA1MSG1`, a XOR and `SHA1MSG2` extend the message schedule
+    /// four words at a time.
+    #[target_feature(enable = "sha,sse2")]
+    #[inline]
+    fn compress(abcd0: __m128i, e0: __m128i, mut w: [__m128i; 4]) -> (__m128i, __m128i) {
+        let mut abcd = abcd0;
+        // `abcd` before the last four rounds, whose `a` gives the next `e`
+        let mut before = abcd0;
+        // Four rounds on schedule vector `$i`, with round function `$f`.
+        macro_rules! rounds {
+            ($i:expr, $f:expr) => {
+                let wk = if $i == 0 {
+                    _mm_add_epi32(e0, w[0])
+                } else {
+                    _mm_sha1nexte_epu32(before, w[$i % 4])
+                };
+                before = abcd;
+                abcd = _mm_sha1rnds4_epu32::<$f>(abcd, wk);
+            };
+        }
+        // The same, then schedule vector `$i + 4` in the slot `$i` used.
+        macro_rules! rounds_and_schedule {
+            ($i:expr, $f:expr) => {
+                rounds!($i, $f);
+                w[$i % 4] = _mm_sha1msg2_epu32(
+                    _mm_xor_si128(
+                        _mm_sha1msg1_epu32(w[$i % 4], w[($i + 1) % 4]),
+                        w[($i + 2) % 4],
+                    ),
+                    w[($i + 3) % 4],
+                );
+            };
+        }
+        rounds_and_schedule!(0, 0);
+        rounds_and_schedule!(1, 0);
+        rounds_and_schedule!(2, 0);
+        rounds_and_schedule!(3, 0);
+        rounds_and_schedule!(4, 0);
+        rounds_and_schedule!(5, 1);
+        rounds_and_schedule!(6, 1);
+        rounds_and_schedule!(7, 1);
+        rounds_and_schedule!(8, 1);
+        rounds_and_schedule!(9, 1);
+        rounds_and_schedule!(10, 2);
+        rounds_and_schedule!(11, 2);
+        rounds_and_schedule!(12, 2);
+        rounds_and_schedule!(13, 2);
+        rounds_and_schedule!(14, 2);
+        rounds_and_schedule!(15, 3);
+        rounds!(16, 3);
+        rounds!(17, 3);
+        rounds!(18, 3);
+        rounds!(19, 3);
+        (_mm_add_epi32(abcd, abcd0), _mm_sha1nexte_epu32(before, e0))
+    }
+
+    /// Each iteration hashes a 20-byte digest after a 64-byte key block, so
+    /// its block is the digest, the padding bit, zeros and a length of 84
+    /// bytes. A digest's `e` vector is its fifth word with zeros below, so
+    /// the block's second vector is that vector with the padding bit added:
+    /// built in registers, with nothing stored.
+    #[target_feature(enable = "sha,sse2")]
+    fn rest(inner: [u32; 5], outer: [u32; 5], u: [u32; 5], iterations: u32) -> [u32; 5] {
+        let zero = _mm_setzero_si128();
+        let length = words([0, 0, 0, (64 + 20) * 8]);
+        let padding = words([0, 0x8000_0000, 0, 0]);
+        let state = |s: [u32; 5]| (words([s[0], s[1], s[2], s[3]]), words([s[4], 0, 0, 0]));
+        let (ia, ie) = state(inner);
+        let (oa, oe) = state(outer);
+        let (mut ua, mut ue) = state(u);
+        let (mut sa, mut se) = (ua, ue);
+        for _ in 1..iterations {
+            let (ha, he) = compress(ia, ie, [ua, _mm_or_si128(ue, padding), zero, length]);
+            (ua, ue) = compress(oa, oe, [ha, _mm_or_si128(he, padding), zero, length]);
+            sa = _mm_xor_si128(sa, ua);
+            se = _mm_xor_si128(se, ue);
+        }
+        [
+            lane::<3>(sa),
+            lane::<2>(sa),
+            lane::<1>(sa),
+            lane::<0>(sa),
+            lane::<3>(se),
+        ]
+    }
+}
+
+#[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+mod sha {
     pub(super) fn pbkdf2_rest(_: [u32; 5], _: [u32; 5], _: [u32; 5], _: u32) -> Option<[u32; 5]> {
         None
     }
