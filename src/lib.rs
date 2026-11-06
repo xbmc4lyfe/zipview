@@ -1064,123 +1064,228 @@ pub fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Option<Vec<u
     Some(out)
 }
 
-/// Pure-Rust SHA-1 digest of two slices concatenated (`a || b`).
-fn sha1_pair(a: &[u8], b: &[u8]) -> [u8; 20] {
-    let mut h0 = 0x6745_2301u32;
-    let mut h1 = 0xefcd_ab89u32;
-    let mut h2 = 0x98ba_dcfeu32;
-    let mut h3 = 0x1032_5476u32;
-    let mut h4 = 0xc3d2_e1f0u32;
+/// SHA-1's starting state.
+const SHA1_INIT: [u32; 5] = [
+    0x6745_2301,
+    0xefcd_ab89,
+    0x98ba_dcfe,
+    0x1032_5476,
+    0xc3d2_e1f0,
+];
 
-    let total_len = a.len() + b.len();
-    let bit_len = (total_len as u64) * 8;
-    let mut msg = Vec::with_capacity((total_len + 9).div_ceil(64) * 64);
-    msg.extend_from_slice(a);
-    msg.extend_from_slice(b);
-    msg.push(0x80);
-    while msg.len() % 64 != 56 {
-        msg.push(0);
+/// SHA-1's compression function: `state` after one 64-byte block, given as
+/// its sixteen big-endian words.
+///
+/// Always inlined: PBKDF2's blocks are mostly constant padding, and inlined
+/// into [`HmacSha1::mac_digest`] the compiler folds those words and much of
+/// the message schedule built from them. The rounds are spelled out with the five working variables renamed from
+/// round to round instead of shifted, so nothing moves between registers but
+/// the values each round actually changes.
+#[inline(always)]
+fn sha1_compress(state: [u32; 5], block: [u32; 16]) -> [u32; 5] {
+    let mut w = [0u32; 80];
+    w[..16].copy_from_slice(&block);
+    for i in 16..80 {
+        w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
     }
-    msg.extend_from_slice(&bit_len.to_be_bytes());
+    let [mut a, mut b, mut c, mut d, mut e] = state;
 
-    for chunk in msg.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for (i, word) in w.iter_mut().take(16).enumerate() {
-            let off = i * 4;
-            *word =
-                u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-        for (i, &wi) in w.iter().enumerate() {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999u32),
-                20..=39 => (b ^ c ^ d, 0x6ed9_eba1u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc_u32),
-                _ => (b ^ c ^ d, 0xca62_c1d6u32),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(wi);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
+    // One round: `e` takes the new value and `b` its rotation; the caller
+    // passes the variables in the order this round sees them.
+    macro_rules! round {
+        ($a:ident, $b:ident, $c:ident, $d:ident, $e:ident, $f:expr, $k:expr, $i:expr) => {
+            $e = $e
+                .wrapping_add($a.rotate_left(5))
+                .wrapping_add($f)
+                .wrapping_add($k)
+                .wrapping_add(w[$i]);
+            $b = $b.rotate_left(30);
+        };
+    }
+    // Five rounds, after which the names are back where they started.
+    macro_rules! five {
+        ($i:expr, $f:ident, $k:expr) => {
+            round!(a, b, c, d, e, $f(b, c, d), $k, $i);
+            round!(e, a, b, c, d, $f(a, b, c), $k, $i + 1);
+            round!(d, e, a, b, c, $f(e, a, b), $k, $i + 2);
+            round!(c, d, e, a, b, $f(d, e, a), $k, $i + 3);
+            round!(b, c, d, e, a, $f(c, d, e), $k, $i + 4);
+        };
+    }
+    #[inline(always)]
+    fn choose(b: u32, c: u32, d: u32) -> u32 {
+        d ^ (b & (c ^ d))
+    }
+    #[inline(always)]
+    fn parity(b: u32, c: u32, d: u32) -> u32 {
+        b ^ c ^ d
+    }
+    #[inline(always)]
+    fn majority(b: u32, c: u32, d: u32) -> u32 {
+        (b & c) | (d & (b | c))
     }
 
-    let mut out = [0u8; 20];
-    out[0..4].copy_from_slice(&h0.to_be_bytes());
-    out[4..8].copy_from_slice(&h1.to_be_bytes());
-    out[8..12].copy_from_slice(&h2.to_be_bytes());
-    out[12..16].copy_from_slice(&h3.to_be_bytes());
-    out[16..20].copy_from_slice(&h4.to_be_bytes());
-    out
+    for i in (0..20).step_by(5) {
+        five!(i, choose, 0x5a82_7999);
+    }
+    for i in (20..40).step_by(5) {
+        five!(i, parity, 0x6ed9_eba1);
+    }
+    for i in (40..60).step_by(5) {
+        five!(i, majority, 0x8f1b_bcdc);
+    }
+    for i in (60..80).step_by(5) {
+        five!(i, parity, 0xca62_c1d6);
+    }
+    [
+        state[0].wrapping_add(a),
+        state[1].wrapping_add(b),
+        state[2].wrapping_add(c),
+        state[3].wrapping_add(d),
+        state[4].wrapping_add(e),
+    ]
 }
 
-fn hmac_sha1_pads(key: &[u8]) -> ([u8; 64], [u8; 64]) {
-    let mut k = [0u8; 64];
-    if key.len() > 64 {
-        let digest = sha1_pair(key, &[]);
-        k[..20].copy_from_slice(&digest);
-    } else {
-        k[..key.len()].copy_from_slice(key);
-    }
-    let mut ipad = [0x36u8; 64];
-    let mut opad = [0x5cu8; 64];
-    for i in 0..64 {
-        ipad[i] ^= k[i];
-        opad[i] ^= k[i];
-    }
-    (ipad, opad)
+/// [`sha1_compress`] as a call, for the paths that run once per message.
+#[inline(never)]
+fn sha1_compress_call(state: [u32; 5], block: [u32; 16]) -> [u32; 5] {
+    sha1_compress(state, block)
 }
 
-fn hmac_sha1(ipad: &[u8; 64], opad: &[u8; 64], data: &[u8]) -> [u8; 20] {
-    let inner = sha1_pair(ipad, data);
-    sha1_pair(opad, &inner)
+/// The big-endian words of a 64-byte block.
+fn sha1_words(block: &[u8]) -> [u32; 16] {
+    let mut w = [0u32; 16];
+    for (word, bytes) in w.iter_mut().zip(block.chunks_exact(4)) {
+        *word = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    }
+    w
+}
+
+/// Finishes a SHA-1 begun in `state`, after `prefix_len` bytes already
+/// compressed into it (a multiple of 64), with `data` as the rest of the
+/// message.
+fn sha1_finish(mut state: [u32; 5], prefix_len: u64, data: &[u8]) -> [u32; 5] {
+    let mut blocks = data.chunks_exact(64);
+    for block in &mut blocks {
+        state = sha1_compress_call(state, sha1_words(block));
+    }
+    let rest = blocks.remainder();
+    let bit_len = (prefix_len + data.len() as u64) * 8;
+    let mut tail = [0u8; 128];
+    tail[..rest.len()].copy_from_slice(rest);
+    tail[rest.len()] = 0x80;
+    let end = if rest.len() < 56 { 64 } else { 128 };
+    tail[end - 8..end].copy_from_slice(&bit_len.to_be_bytes());
+    for block in tail[..end].chunks_exact(64) {
+        state = sha1_compress_call(state, sha1_words(block));
+    }
+    state
+}
+
+/// HMAC-SHA1 under one key, with the key's two padded blocks compressed once
+/// up front rather than on every message.
+struct HmacSha1 {
+    inner: [u32; 5],
+    outer: [u32; 5],
+}
+
+impl HmacSha1 {
+    fn new(key: &[u8]) -> Self {
+        let mut k = [0u8; 64];
+        if key.len() > 64 {
+            for (slot, word) in k.chunks_exact_mut(4).zip(sha1_finish(SHA1_INIT, 0, key)) {
+                slot.copy_from_slice(&word.to_be_bytes());
+            }
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let ipad = k.map(|b| b ^ 0x36);
+        let opad = k.map(|b| b ^ 0x5c);
+        Self {
+            inner: sha1_compress_call(SHA1_INIT, sha1_words(&ipad)),
+            outer: sha1_compress_call(SHA1_INIT, sha1_words(&opad)),
+        }
+    }
+
+    /// The MAC of any message, as words.
+    fn mac(&self, message: &[u8]) -> [u32; 5] {
+        let inner = sha1_finish(self.inner, 64, message);
+        Self::mac_digest(inner, self.outer)
+    }
+
+    /// The MAC of a 20-byte message given as words, which is all PBKDF2's
+    /// iterations hash: one block for the inner hash and one for the outer.
+    fn mac20(&self, message: [u32; 5]) -> [u32; 5] {
+        let inner = Self::mac_digest(message, self.inner);
+        Self::mac_digest(inner, self.outer)
+    }
+
+    /// `state` finished over a 20-byte digest after one 64-byte key block:
+    /// the digest, the padding byte, zeros and a length of 84 bytes.
+    #[inline(always)]
+    fn mac_digest(digest: [u32; 5], state: [u32; 5]) -> [u32; 5] {
+        let mut block = [0u32; 16];
+        block[..5].copy_from_slice(&digest);
+        block[5] = 0x8000_0000;
+        block[15] = (64 + 20) * 8;
+        sha1_compress(state, block)
+    }
+}
+
+/// PBKDF2's iteration count for WinZip AES.
+const WINZIP_ITERATIONS: u32 = 1000;
+
+/// Bytes `start..end` of PBKDF2-HMAC-SHA1's output, computing only the
+/// 20-byte blocks that cover them: blocks are independent, so a password
+/// check needs just the one holding the verifier.
+fn pbkdf2_sha1(
+    mac: &HmacSha1,
+    salt: &[u8],
+    iterations: u32,
+    start: usize,
+    end: usize,
+) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(end.checked_sub(start)?);
+    let mut message = Vec::with_capacity(salt.len() + 4);
+    for index in start / 20..end.div_ceil(20) {
+        message.clear();
+        message.extend_from_slice(salt);
+        message.extend_from_slice(&u32::try_from(index + 1).ok()?.to_be_bytes());
+        let mut u = mac.mac(&message);
+        let mut sum = u;
+        for _ in 1..iterations {
+            u = mac.mac20(u);
+            for (s, x) in sum.iter_mut().zip(u) {
+                *s ^= x;
+            }
+        }
+        let mut block = [0u8; 20];
+        for (bytes, word) in block.chunks_exact_mut(4).zip(sum) {
+            bytes.copy_from_slice(&word.to_be_bytes());
+        }
+        let from = start.saturating_sub(index * 20);
+        let to = (end - index * 20).min(20);
+        out.extend_from_slice(&block[from..to]);
+    }
+    Some(out)
 }
 
 /// PBKDF2-HMAC-SHA1 (1000 rounds) as specified by WinZip AES: derives `2 * key_len + 2` bytes.
 pub fn aes_derive(password: &[u8], salt: &[u8], key_len: usize) -> Option<Vec<u8>> {
-    let (ipad, opad) = hmac_sha1_pads(password);
-    let wanted = key_len * 2 + 2;
-    let mut derived = Vec::with_capacity(wanted + 20);
-    let mut block = 1u32;
-    let mut salt_block = Vec::with_capacity(salt.len() + 4);
-    while derived.len() < wanted {
-        salt_block.clear();
-        salt_block.extend_from_slice(salt);
-        salt_block.extend_from_slice(&block.to_be_bytes());
-        let mut u = hmac_sha1(&ipad, &opad, &salt_block);
-        let mut out = u;
-        for _ in 1..1000 {
-            u = hmac_sha1(&ipad, &opad, &u);
-            for (slot, b) in out.iter_mut().zip(u) {
-                *slot ^= b;
-            }
-        }
-        derived.extend_from_slice(&out);
-        block += 1;
-    }
-    derived.truncate(wanted);
-    Some(derived)
+    let wanted = key_len.checked_mul(2)?.checked_add(2)?;
+    pbkdf2_sha1(&HmacSha1::new(password), salt, WINZIP_ITERATIONS, 0, wanted)
+}
+
+/// The two verifier bytes WinZip AES derives after the key and MAC key.
+fn aes_verifier_with(mac: &HmacSha1, salt: &[u8], key_len: usize) -> Option<[u8; 2]> {
+    let at = key_len.checked_mul(2)?;
+    pbkdf2_sha1(mac, salt, WINZIP_ITERATIONS, at, at.checked_add(2)?)?
+        .try_into()
+        .ok()
 }
 
 fn aes_verifier(password: &[u8], salt: &[u8], key_len: usize) -> Option<[u8; 2]> {
-    let derived = aes_derive(password, salt, key_len)?;
-    let wanted = key_len * 2 + 2;
-    derived.get(wanted - 2..wanted)?.try_into().ok()
+    aes_verifier_with(&HmacSha1::new(password), salt, key_len)
 }
 
 /// Decrypts a WinZip AES (method 99) entry starting at `data` (`salt + verifier + ciphertext [+ 10-byte auth]`).
@@ -1197,11 +1302,14 @@ pub fn decrypt_winzip_aes(
     let key_len = (usize::from(strength) + 1) * 8;
     let salt = data.get(..salt_len)?;
     let verifier = data.get(salt_len..salt_len + 2)?;
-    let derived = aes_derive(password.as_bytes(), salt, key_len)?;
-    if derived.get(key_len * 2..key_len * 2 + 2) != Some(verifier) {
+    // The verifier first: a wrong password costs one PBKDF2 block, and the
+    // MAC key between the AES key and the verifier is never derived.
+    let mac = HmacSha1::new(password.as_bytes());
+    if aes_verifier_with(&mac, salt, key_len)?[..] != *verifier {
         return None;
     }
-    let key = derived.get(..key_len)?;
+    let key = pbkdf2_sha1(&mac, salt, WINZIP_ITERATIONS, 0, key_len)?;
+    let key = &key[..];
     let ct_end = match full_packed.and_then(|p| usize::try_from(p).ok()) {
         Some(p) if p >= salt_len + 12 => data.len().min(p - 10),
         _ => data.len(),
@@ -1586,6 +1694,212 @@ mod tests {
         // Must stop at the first non-signature rather than trusting the count.
         let r = ZipReader::new(&zip).expect("parse");
         assert_eq!(r.len(), 1);
+    }
+
+    /// PBKDF2-HMAC-SHA1 as first written, hashing every block in full: the
+    /// reference the precomputed-pad version must match.
+    /// Pure-Rust SHA-1 digest of two slices concatenated (`a || b`).
+    fn sha1_reference(a: &[u8], b: &[u8]) -> [u8; 20] {
+        let mut h0 = 0x6745_2301u32;
+        let mut h1 = 0xefcd_ab89u32;
+        let mut h2 = 0x98ba_dcfeu32;
+        let mut h3 = 0x1032_5476u32;
+        let mut h4 = 0xc3d2_e1f0u32;
+
+        let total_len = a.len() + b.len();
+        let bit_len = (total_len as u64) * 8;
+        let mut msg = Vec::with_capacity((total_len + 9).div_ceil(64) * 64);
+        msg.extend_from_slice(a);
+        msg.extend_from_slice(b);
+        msg.push(0x80);
+        while msg.len() % 64 != 56 {
+            msg.push(0);
+        }
+        msg.extend_from_slice(&bit_len.to_be_bytes());
+
+        for chunk in msg.chunks_exact(64) {
+            let mut w = [0u32; 80];
+            for (i, word) in w.iter_mut().take(16).enumerate() {
+                let off = i * 4;
+                *word = u32::from_be_bytes([
+                    chunk[off],
+                    chunk[off + 1],
+                    chunk[off + 2],
+                    chunk[off + 3],
+                ]);
+            }
+            for i in 16..80 {
+                w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
+            }
+            let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
+            for (i, &wi) in w.iter().enumerate() {
+                let (f, k) = match i {
+                    0..=19 => ((b & c) | ((!b) & d), 0x5a82_7999u32),
+                    20..=39 => (b ^ c ^ d, 0x6ed9_eba1u32),
+                    40..=59 => ((b & c) | (b & d) | (c & d), 0x8f1b_bcdc_u32),
+                    _ => (b ^ c ^ d, 0xca62_c1d6u32),
+                };
+                let temp = a
+                    .rotate_left(5)
+                    .wrapping_add(f)
+                    .wrapping_add(e)
+                    .wrapping_add(k)
+                    .wrapping_add(wi);
+                e = d;
+                d = c;
+                c = b.rotate_left(30);
+                b = a;
+                a = temp;
+            }
+            h0 = h0.wrapping_add(a);
+            h1 = h1.wrapping_add(b);
+            h2 = h2.wrapping_add(c);
+            h3 = h3.wrapping_add(d);
+            h4 = h4.wrapping_add(e);
+        }
+
+        let mut out = [0u8; 20];
+        out[0..4].copy_from_slice(&h0.to_be_bytes());
+        out[4..8].copy_from_slice(&h1.to_be_bytes());
+        out[8..12].copy_from_slice(&h2.to_be_bytes());
+        out[12..16].copy_from_slice(&h3.to_be_bytes());
+        out[16..20].copy_from_slice(&h4.to_be_bytes());
+        out
+    }
+
+    fn hmac_pads_reference(key: &[u8]) -> ([u8; 64], [u8; 64]) {
+        let mut k = [0u8; 64];
+        if key.len() > 64 {
+            let digest = sha1_reference(key, &[]);
+            k[..20].copy_from_slice(&digest);
+        } else {
+            k[..key.len()].copy_from_slice(key);
+        }
+        let mut ipad = [0x36u8; 64];
+        let mut opad = [0x5cu8; 64];
+        for i in 0..64 {
+            ipad[i] ^= k[i];
+            opad[i] ^= k[i];
+        }
+        (ipad, opad)
+    }
+
+    fn hmac_reference(ipad: &[u8; 64], opad: &[u8; 64], data: &[u8]) -> [u8; 20] {
+        let inner = sha1_reference(ipad, data);
+        sha1_reference(opad, &inner)
+    }
+
+    /// PBKDF2-HMAC-SHA1 (1000 rounds) as specified by WinZip AES: derives `2 * key_len + 2` bytes.
+    fn aes_derive_reference(password: &[u8], salt: &[u8], key_len: usize) -> Vec<u8> {
+        let (ipad, opad) = hmac_pads_reference(password);
+        let wanted = key_len * 2 + 2;
+        let mut derived = Vec::with_capacity(wanted + 20);
+        let mut block = 1u32;
+        let mut salt_block = Vec::with_capacity(salt.len() + 4);
+        while derived.len() < wanted {
+            salt_block.clear();
+            salt_block.extend_from_slice(salt);
+            salt_block.extend_from_slice(&block.to_be_bytes());
+            let mut u = hmac_reference(&ipad, &opad, &salt_block);
+            let mut out = u;
+            for _ in 1..1000 {
+                u = hmac_reference(&ipad, &opad, &u);
+                for (slot, b) in out.iter_mut().zip(u) {
+                    *slot ^= b;
+                }
+            }
+            derived.extend_from_slice(&out);
+            block += 1;
+        }
+        derived.truncate(wanted);
+        derived
+    }
+
+    fn hex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    fn sha1(data: &[u8]) -> Vec<u8> {
+        sha1_finish(SHA1_INIT, 0, data)
+            .iter()
+            .flat_map(|w| w.to_be_bytes())
+            .collect()
+    }
+
+    #[test]
+    fn sha1_and_pbkdf2_match_published_vectors() {
+        // FIPS 180-2 and the usual extra lengths around the padding boundary.
+        assert_eq!(sha1(b""), hex("da39a3ee5e6b4b0d3255bfef95601890afd80709"));
+        assert_eq!(
+            sha1(b"abc"),
+            hex("a9993e364706816aba3e25717850c26c9cd0d89d")
+        );
+        assert_eq!(
+            sha1(b"abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"),
+            hex("84983e441c3bd26ebaae4aa1f95129e5e54670f1")
+        );
+        assert_eq!(
+            sha1(&[b'a'; 1_000_000]),
+            hex("34aa973cd4c4daa4f61eeb2bdbad27316534016f")
+        );
+        for len in 0..200 {
+            let data: Vec<u8> = (0..len).map(|i| (i * 7 + 3) as u8).collect();
+            assert_eq!(sha1(&data), sha1_reference(&data, &[]), "length {len}");
+        }
+        // RFC 6070.
+        let mac = HmacSha1::new(b"password");
+        for (iterations, want) in [
+            (1, "0c60c80f961f0e71f3a9b524af6012062fe037a6"),
+            (2, "ea6c014dc72d6f8ccd1ed92ace1d41f0d8de8957"),
+            (4096, "4b007901b765489abead49d926f721d065a429c1"),
+        ] {
+            assert_eq!(
+                pbkdf2_sha1(&mac, b"salt", iterations, 0, 20).unwrap(),
+                hex(want)
+            );
+        }
+        let mac = HmacSha1::new(b"passwordPASSWORDpassword");
+        let salt = b"saltSALTsaltSALTsaltSALTsaltSALTsalt";
+        let want = hex("3d2eec4fe41c849b80c8d83662c0e44a8b291a964cf2f07038");
+        assert_eq!(pbkdf2_sha1(&mac, salt, 4096, 0, 25).unwrap(), want);
+        // Any window of the output is the same bytes as in the whole.
+        for (start, end) in [(0, 1), (3, 21), (19, 20), (20, 25), (24, 25), (5, 5)] {
+            assert_eq!(
+                pbkdf2_sha1(&mac, salt, 4096, start, end).unwrap(),
+                want[start..end],
+                "{start}..{end}"
+            );
+        }
+    }
+
+    #[test]
+    fn aes_key_derivation_matches_the_reference() {
+        let long = "x".repeat(100);
+        for password in [
+            "",
+            "secret",
+            "exactly-sixty-four-bytes-long-password-for-the-hmac-key-block!!",
+            &long,
+        ] {
+            for salt_len in [0, 8, 12, 16, 55, 56, 64, 70] {
+                let salt: Vec<u8> = (0..salt_len).map(|i| (i * 13 + 1) as u8).collect();
+                for key_len in [16, 24, 32] {
+                    let want = aes_derive_reference(password.as_bytes(), &salt, key_len);
+                    assert_eq!(
+                        aes_derive(password.as_bytes(), &salt, key_len).unwrap(),
+                        want,
+                        "{password:?} salt {salt_len} key {key_len}"
+                    );
+                    assert_eq!(
+                        aes_verifier(password.as_bytes(), &salt, key_len).unwrap(),
+                        want[key_len * 2..]
+                    );
+                }
+            }
+        }
     }
 
     #[test]
