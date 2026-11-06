@@ -54,7 +54,7 @@
 //! Every field is read through bounds-checked helpers, so a truncated or
 //! hostile archive yields `Err`, never a panic or an out-of-bounds read.
 //! Parsing has no `unsafe`. The only `unsafe` in the crate is in `accel`,
-//! which runs the processor's own AES and SHA-1 instructions where it has them, checked
+//! which runs the processor's own AES, SHA-1 and CRC-32 instructions where it has them, checked
 //! for at run time, with the portable code as the fallback. Inflation is done
 //! by `flate2` on its `zlib-rs` backend, which also uses `unsafe`, for speed.
 //!
@@ -1063,8 +1063,10 @@ pub fn decrypt_zipcrypto(password: &str, check: u8, data: &[u8]) -> Option<Vec<u
         return None;
     }
     let mut out = Vec::with_capacity(payload.len());
-    for b in payload {
-        out.push(crypto_step(&mut keys, *b));
+    if !accel::zipcrypto_decrypt(&mut keys, payload, &mut out) {
+        for b in payload {
+            out.push(crypto_step(&mut keys, *b));
+        }
     }
     Some(out)
 }
@@ -1995,6 +1997,33 @@ mod tests {
                 if let Some(fast) = accel::pbkdf2_sha1_rest(mac.inner, mac.outer, u, iterations) {
                     assert_eq!(fast, portable, "{iterations} iterations");
                 }
+            }
+        }
+    }
+
+    #[test]
+    fn zipcrypto_decryption_agrees_with_and_without_crc_instructions() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let mut next = || {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            x as u32
+        };
+        for len in [0, 1, 2, 3, 15, 16, 17, 255, 256, 4099] {
+            let data: Vec<u8> = (0..len).map(|_| next() as u8).collect();
+            let start = [next(), next(), next()];
+            let mut portable_keys = start;
+            let portable: Vec<u8> = data
+                .iter()
+                .map(|&b| crypto_step(&mut portable_keys, b))
+                .collect();
+            let mut fast_keys = start;
+            let mut fast = vec![7u8; 3]; // appends after what is there
+            if accel::zipcrypto_decrypt(&mut fast_keys, &data, &mut fast) {
+                assert_eq!(fast[..3], [7; 3]);
+                assert_eq!(fast[3..], portable[..], "{len} bytes");
+                assert_eq!(fast_keys, portable_keys, "{len} bytes");
             }
         }
     }

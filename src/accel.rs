@@ -14,7 +14,7 @@
 // You should have received a copy of the GNU General Public License along
 // with this program. If not, see <https://www.gnu.org/licenses/>.
 
-//! The processor's own AES and SHA-1 instructions, where it has them.
+//! The processor's own AES, SHA-1 and CRC-32 instructions, where it has them.
 //!
 //! This is the crate's only `unsafe`: calling an instruction the compiler
 //! cannot assume the processor has, and reading and writing whole 16-byte
@@ -448,5 +448,57 @@ mod sha {
 mod sha {
     pub(super) fn pbkdf2_rest(_: [u32; 5], _: [u32; 5], _: [u32; 5], _: u32) -> Option<[u32; 5]> {
         None
+    }
+}
+
+/// Decrypts ZipCrypto `data` from the cipher state `keys`, appending the
+/// plain bytes to `out` and leaving `keys` where the data ends, using the
+/// processor's CRC-32 instructions for the two CRC steps of each byte.
+/// `false`, with nothing changed, when it has none.
+pub(crate) fn zipcrypto_decrypt(keys: &mut [u32; 3], data: &[u8], out: &mut Vec<u8>) -> bool {
+    crc::zipcrypto_decrypt(keys, data, out)
+}
+
+#[cfg(target_arch = "aarch64")]
+mod crc {
+    use std::arch::aarch64::__crc32b;
+
+    pub(super) fn zipcrypto_decrypt(keys: &mut [u32; 3], data: &[u8], out: &mut Vec<u8>) -> bool {
+        if !std::arch::is_aarch64_feature_detected!("crc") {
+            return false;
+        }
+        // SAFETY: the processor has the CRC-32 instructions (checked above)
+        unsafe { run(keys, data, out) };
+        true
+    }
+
+    /// `CRC32B` is one byte of the reflected CRC-32 that ZIP uses, without
+    /// the inversions at either end: exactly ZipCrypto's key update. Each
+    /// byte's keystream depends on the byte before it, so this is one long
+    /// chain, and the instruction is shorter than a table lookup.
+    #[target_feature(enable = "crc")]
+    fn run(keys: &mut [u32; 3], data: &[u8], out: &mut Vec<u8>) {
+        let [mut k0, mut k1, mut k2] = *keys;
+        out.reserve(data.len());
+        for &cipher in data {
+            let t = k2 | 2;
+            let plain = cipher ^ (t.wrapping_mul(t ^ 1) >> 8) as u8;
+            k0 = __crc32b(k0, plain);
+            k1 = k1
+                .wrapping_add(k0 & 0xff)
+                .wrapping_mul(134_775_813)
+                .wrapping_add(1);
+            k2 = __crc32b(k2, (k1 >> 24) as u8);
+            out.push(plain);
+        }
+        *keys = [k0, k1, k2];
+    }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
+mod crc {
+    // x86's CRC32 instruction is CRC-32C, a different polynomial.
+    pub(super) fn zipcrypto_decrypt(_: &mut [u32; 3], _: &[u8], _: &mut Vec<u8>) -> bool {
+        false
     }
 }
