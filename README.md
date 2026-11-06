@@ -63,8 +63,9 @@ Every field is read through bounds-checked helpers, so a truncated or hostile
 archive yields `Err`, never a panic. Parsing has no `unsafe`. The crate's only
 `unsafe` is in `src/accel.rs`, which runs the processor's AES instructions
 (ARMv8 AES, x86 AES-NI) and, for the WinZip AES key derivation, its SHA-1
-instructions (64-bit ARM), after checking for them at run time; without them
-the portable code runs, and the tests hold both to the same reference.
+instructions (ARMv8 SHA1, x86 SHA extensions), after checking for them at run
+time; without them the portable code runs, and the tests hold both to the same
+reference.
 `zlib-rs` uses `unsafe` internally for its SIMD paths too.
 
 - **The central directory is the only source of sizes and offsets.** Local
