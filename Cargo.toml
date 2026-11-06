@@ -2,7 +2,7 @@
 name = "zipview"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.87"
 authors = ["zipview contributors"]
 license = "GPL-3.0"
 description = "Read-only, allocation-bounded ZIP container reader. No extraction, no writing, no filesystem access."

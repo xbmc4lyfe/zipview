@@ -53,8 +53,10 @@
 //!
 //! Every field is read through bounds-checked helpers, so a truncated or
 //! hostile archive yields `Err`, never a panic or an out-of-bounds read.
-//! There is no `unsafe` in this crate. Inflation is done by `flate2` on its
-//! `zlib-rs` backend, which does use `unsafe` internally, for speed.
+//! Parsing has no `unsafe`. The only `unsafe` in the crate is in `accel`,
+//! which runs the processor's own AES instructions where it has them, checked
+//! for at run time, with the portable code as the fallback. Inflation is done
+//! by `flate2` on its `zlib-rs` backend, which also uses `unsafe`, for speed.
 //!
 //! - The central directory is the single source of truth for sizes and
 //!   offsets. Local headers are checked only for their signature; their size
@@ -110,8 +112,10 @@
 //! because a reader that parsed headers safely but trusted the payload offset
 //! would pass an enumeration-only target.
 
-#![forbid(unsafe_code)]
-#![warn(missing_docs)]
+#![deny(unsafe_op_in_unsafe_fn)]
+#![warn(missing_docs, clippy::undocumented_unsafe_blocks)]
+
+mod accel;
 
 use std::borrow::Cow;
 
@@ -1472,12 +1476,20 @@ fn aes_encrypt<const NR: usize, const N: usize>(
 pub fn decrypt_winzip_ctr(key: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
     let (rk, nr) = aes_expand_key(key)?;
     let mut out = ciphertext.to_vec();
-    match nr {
-        10 => ctr_xor::<10>(&rk, &mut out),
-        12 => ctr_xor::<12>(&rk, &mut out),
-        _ => ctr_xor::<14>(&rk, &mut out),
+    if !accel::aes_ctr_xor(&rk, nr, &mut out) {
+        ctr_xor_portable(&rk, nr, &mut out);
     }
     Some(out)
+}
+
+/// [`ctr_xor`] for a key of `nr` rounds: the keystream from table lookups, for
+/// processors without AES instructions.
+fn ctr_xor_portable(rk: &[u32; 60], nr: usize, data: &mut [u8]) {
+    match nr {
+        10 => ctr_xor::<10>(rk, data),
+        12 => ctr_xor::<12>(rk, data),
+        _ => ctr_xor::<14>(rk, data),
+    }
 }
 
 /// How many counter blocks CTR encrypts side by side. Two keep the 64-bit ARM
@@ -2134,6 +2146,12 @@ mod tests {
                 want,
                 "key {key_len}"
             );
+            // The table-driven keystream too, which processors with AES
+            // instructions never run through the public function.
+            let (rk, nr) = aes_expand_key(&key).unwrap();
+            let mut portable = data.clone();
+            ctr_xor_portable(&rk, nr, &mut portable);
+            assert_eq!(portable, want, "portable, key {key_len}");
             for len in (0..200).chain([4095, 4096, 4097, 65_535, 65_536, 65_537]) {
                 assert_eq!(
                     decrypt_winzip_ctr(&key, &data[..len]).unwrap(),
