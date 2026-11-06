@@ -742,7 +742,9 @@ impl<'a> ZipReader<'a> {
         }
         let local_name_len = u16_at(self.data, local + 26).ok()? as usize;
         let local_extra_len = u16_at(self.data, local + 28).ok()? as usize;
-        let extra_start = local.checked_add(LOCAL_HEADER_LEN)?.checked_add(local_name_len)?;
+        let extra_start = local
+            .checked_add(LOCAL_HEADER_LEN)?
+            .checked_add(local_name_len)?;
         let data_start = extra_start.checked_add(local_extra_len)?;
         let local_extra = self.data.get(extra_start..data_start)?;
         let entry_slice = self.data.get(local..)?;
@@ -810,7 +812,9 @@ impl<'a> ZipReader<'a> {
 
         let (decrypted_buf, method);
         let payload_bytes: &[u8] = if entry.is_encrypted() {
-            let pw = password.filter(|s| !s.is_empty()).ok_or(ZipReadError::Encrypted)?;
+            let pw = password
+                .filter(|s| !s.is_empty())
+                .ok_or(ZipReadError::Encrypted)?;
             if entry.compression == 99 {
                 let (strength, actual_method) = entry
                     .aes_info
@@ -1083,7 +1087,8 @@ fn sha1_pair(a: &[u8], b: &[u8]) -> [u8; 20] {
         let mut w = [0u32; 80];
         for (i, word) in w.iter_mut().take(16).enumerate() {
             let off = i * 4;
-            *word = u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
+            *word =
+                u32::from_be_bytes([chunk[off], chunk[off + 1], chunk[off + 2], chunk[off + 3]]);
         }
         for i in 16..80 {
             w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
@@ -1225,8 +1230,16 @@ const SBOX: [u8; 256] = [
 ];
 
 const RCON: [u32; 10] = [
-    0x0100_0000, 0x0200_0000, 0x0400_0000, 0x0800_0000, 0x1000_0000,
-    0x2000_0000, 0x4000_0000, 0x8000_0000, 0x1b00_0000, 0x3600_0000,
+    0x0100_0000,
+    0x0200_0000,
+    0x0400_0000,
+    0x0800_0000,
+    0x1000_0000,
+    0x2000_0000,
+    0x4000_0000,
+    0x8000_0000,
+    0x1b00_0000,
+    0x3600_0000,
 ];
 
 fn sub_word(w: u32) -> u32 {
@@ -1284,8 +1297,8 @@ fn aes_encrypt_block(rk: &[[u8; 16]; 15], nr: usize, block: &[u8; 16]) -> [u8; 1
             *b = SBOX[usize::from(*b)];
         }
         s = [
-            s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3],
-            s[8], s[13], s[2], s[7], s[12], s[1], s[6], s[11],
+            s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12],
+            s[1], s[6], s[11],
         ];
         for col in s.chunks_exact_mut(4) {
             let (s0, s1, s2, s3) = (col[0], col[1], col[2], col[3]);
@@ -1303,8 +1316,8 @@ fn aes_encrypt_block(rk: &[[u8; 16]; 15], nr: usize, block: &[u8; 16]) -> [u8; 1
         *b = SBOX[usize::from(*b)];
     }
     s = [
-        s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3],
-        s[8], s[13], s[2], s[7], s[12], s[1], s[6], s[11],
+        s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12], s[1],
+        s[6], s[11],
     ];
     for (b, &k) in s.iter_mut().zip(&rk[nr]) {
         *b ^= k;
@@ -1614,13 +1627,8 @@ mod tests {
         aes_payload.extend_from_slice(&[0xa3, 0x36]);
         aes_payload.extend_from_slice(&ct);
         aes_payload.extend_from_slice(&[0u8; 10]);
-        let dec = decrypt_winzip_aes(
-            "secret",
-            3,
-            &aes_payload,
-            Some(aes_payload.len() as u64),
-        )
-        .expect("decrypt winzip aes");
+        let dec = decrypt_winzip_aes("secret", 3, &aes_payload, Some(aes_payload.len() as u64))
+            .expect("decrypt winzip aes");
         assert_eq!(dec, b"winzip aes payload");
     }
 }
