@@ -1360,12 +1360,38 @@ fn sub_word(w: u32) -> u32 {
     ])
 }
 
-#[inline]
-fn xtime(x: u8) -> u8 {
-    (x << 1) ^ if x & 0x80 != 0 { 0x1b } else { 0 }
+/// AES's MixColumns of a byte `s` in column position 0, `(2s, s, s, 3s)`
+/// as a big-endian word; positions 1-3 are its rotations. One lookup per
+/// state byte then does SubBytes, ShiftRows (by which byte is looked up) and
+/// MixColumns at once.
+const TE0: [u32; 256] = {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        let s = SBOX[i];
+        let s2 = (s << 1) ^ if s & 0x80 != 0 { 0x1b } else { 0 };
+        let s3 = s2 ^ s;
+        table[i] = u32::from_be_bytes([s2, s, s, s3]);
+        i += 1;
+    }
+    table
+};
+const TE1: [u32; 256] = rotated(8);
+const TE2: [u32; 256] = rotated(16);
+const TE3: [u32; 256] = rotated(24);
+
+const fn rotated(bits: u32) -> [u32; 256] {
+    let mut table = [0u32; 256];
+    let mut i = 0;
+    while i < 256 {
+        table[i] = TE0[i].rotate_right(bits);
+        i += 1;
+    }
+    table
 }
 
-fn aes_expand_key(key: &[u8]) -> Option<([[u8; 16]; 15], usize)> {
+/// The expanded key as big-endian words, and the number of rounds.
+fn aes_expand_key(key: &[u8]) -> Option<([u32; 60], usize)> {
     let (nk, nr) = match key.len() {
         16 => (4usize, 10usize),
         24 => (6usize, 12usize),
@@ -1386,49 +1412,57 @@ fn aes_expand_key(key: &[u8]) -> Option<([[u8; 16]; 15], usize)> {
         }
         w[i] = w[i - nk] ^ temp;
     }
-    let mut rk = [[0u8; 16]; 15];
-    for r in 0..=nr {
-        for c in 0..4 {
-            rk[r][c * 4..c * 4 + 4].copy_from_slice(&w[r * 4 + c].to_be_bytes());
-        }
-    }
-    Some((rk, nr))
+    Some((w, nr))
 }
 
-fn aes_encrypt_block(rk: &[[u8; 16]; 15], nr: usize, block: &[u8; 16]) -> [u8; 16] {
-    let mut s = *block;
-    for (b, &k) in s.iter_mut().zip(&rk[0]) {
-        *b ^= k;
-    }
-    for round_key in rk.iter().take(nr).skip(1) {
-        for b in &mut s {
-            *b = SBOX[usize::from(*b)];
-        }
-        s = [
-            s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12],
-            s[1], s[6], s[11],
-        ];
-        for col in s.chunks_exact_mut(4) {
-            let (s0, s1, s2, s3) = (col[0], col[1], col[2], col[3]);
-            let t = s0 ^ s1 ^ s2 ^ s3;
-            col[0] ^= t ^ xtime(s0 ^ s1);
-            col[1] ^= t ^ xtime(s1 ^ s2);
-            col[2] ^= t ^ xtime(s2 ^ s3);
-            col[3] ^= t ^ xtime(s3 ^ s0);
-        }
-        for (b, &k) in s.iter_mut().zip(round_key) {
-            *b ^= k;
-        }
-    }
+/// Byte `n` (0 = most significant) of `w`, as a table index.
+#[inline(always)]
+fn byte(w: u32, n: u32) -> usize {
+    usize::from((w >> (24 - 8 * n)) as u8)
+}
+
+/// Encrypts `N` blocks (each four big-endian words) side by side under a key
+/// of `NR` rounds. The blocks are independent, so their table lookups
+/// overlap instead of each round waiting on the last.
+#[inline(always)]
+fn aes_encrypt<const NR: usize, const N: usize>(
+    rk: &[u32; 60],
+    mut s: [[u32; 4]; N],
+) -> [[u32; 4]; N] {
     for b in &mut s {
-        *b = SBOX[usize::from(*b)];
+        for (w, k) in b.iter_mut().zip(&rk[..4]) {
+            *w ^= k;
+        }
     }
-    s = [
-        s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12], s[1],
-        s[6], s[11],
-    ];
-    for (b, &k) in s.iter_mut().zip(&rk[nr]) {
-        *b ^= k;
+    for round in 1..NR {
+        let k = &rk[4 * round..4 * round + 4];
+        for b in &mut s {
+            let [s0, s1, s2, s3] = *b;
+            *b = [
+                TE0[byte(s0, 0)] ^ TE1[byte(s1, 1)] ^ TE2[byte(s2, 2)] ^ TE3[byte(s3, 3)] ^ k[0],
+                TE0[byte(s1, 0)] ^ TE1[byte(s2, 1)] ^ TE2[byte(s3, 2)] ^ TE3[byte(s0, 3)] ^ k[1],
+                TE0[byte(s2, 0)] ^ TE1[byte(s3, 1)] ^ TE2[byte(s0, 2)] ^ TE3[byte(s1, 3)] ^ k[2],
+                TE0[byte(s3, 0)] ^ TE1[byte(s0, 1)] ^ TE2[byte(s1, 2)] ^ TE3[byte(s2, 3)] ^ k[3],
+            ];
+        }
+    }
+    let k = &rk[4 * NR..4 * NR + 4];
+    for b in &mut s {
+        let [s0, s1, s2, s3] = *b;
+        let last = |a: u32, b: u32, c: u32, d: u32| {
+            u32::from_be_bytes([
+                SBOX[byte(a, 0)],
+                SBOX[byte(b, 1)],
+                SBOX[byte(c, 2)],
+                SBOX[byte(d, 3)],
+            ])
+        };
+        *b = [
+            last(s0, s1, s2, s3) ^ k[0],
+            last(s1, s2, s3, s0) ^ k[1],
+            last(s2, s3, s0, s1) ^ k[2],
+            last(s3, s0, s1, s2) ^ k[3],
+        ];
     }
     s
 }
@@ -1436,21 +1470,61 @@ fn aes_encrypt_block(rk: &[[u8; 16]; 15], nr: usize, block: &[u8; 16]) -> [u8; 1
 /// Decrypts WinZip AES CTR-mode ciphertext (little-endian counter starting at 1).
 pub fn decrypt_winzip_ctr(key: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
     let (rk, nr) = aes_expand_key(key)?;
-    let mut out = Vec::with_capacity(ciphertext.len());
-    let mut counter = [0u8; 16];
-    for chunk in ciphertext.chunks(16) {
-        for b in &mut counter {
-            *b = b.wrapping_add(1);
-            if *b != 0 {
-                break;
-            }
-        }
-        let ks = aes_encrypt_block(&rk, nr, &counter);
-        for (&c, &k) in chunk.iter().zip(&ks) {
-            out.push(c ^ k);
-        }
+    let mut out = ciphertext.to_vec();
+    match nr {
+        10 => ctr_xor::<10>(&rk, &mut out),
+        12 => ctr_xor::<12>(&rk, &mut out),
+        _ => ctr_xor::<14>(&rk, &mut out),
     }
     Some(out)
+}
+
+/// How many counter blocks CTR encrypts side by side. Two keep the 64-bit ARM
+/// cores' load units busy (Apple M4/M5: two run 13% faster than four, 50%
+/// faster than one). x86-64's sixteen registers can't hold more than one
+/// block's state and temporaries without spilling, and one measured fastest.
+const CTR_LANES: usize = if cfg!(target_arch = "x86_64") { 1 } else { 2 };
+
+/// XORs `data` with the keystream: [`CTR_LANES`] counter blocks at a time,
+/// then one at a time for the rest.
+fn ctr_xor<const NR: usize>(rk: &[u32; 60], data: &mut [u8]) {
+    /// The counter as a block of four big-endian words.
+    fn block(counter: u128) -> [u32; 4] {
+        let b = counter.to_le_bytes();
+        [0, 4, 8, 12].map(|i| u32::from_be_bytes([b[i], b[i + 1], b[i + 2], b[i + 3]]))
+    }
+    /// XORs one keystream block into up to 16 bytes.
+    fn apply(chunk: &mut [u8], ks: [u32; 4]) {
+        let mut bytes = [0u8; 16];
+        for (dst, w) in bytes.chunks_exact_mut(4).zip(ks) {
+            dst.copy_from_slice(&w.to_be_bytes());
+        }
+        if let Ok(whole) = <&mut [u8; 16]>::try_from(&mut *chunk) {
+            *whole = (u128::from_ne_bytes(*whole) ^ u128::from_ne_bytes(bytes)).to_ne_bytes();
+        } else {
+            for (c, k) in chunk.iter_mut().zip(bytes) {
+                *c ^= k;
+            }
+        }
+    }
+    let mut counter = 1u128;
+    let mut groups = data.chunks_exact_mut(16 * CTR_LANES);
+    for group in &mut groups {
+        let blocks: [[u32; 4]; CTR_LANES] =
+            std::array::from_fn(|i| block(counter.wrapping_add(i as u128)));
+        counter = counter.wrapping_add(CTR_LANES as u128);
+        for (chunk, ks) in group
+            .chunks_exact_mut(16)
+            .zip(aes_encrypt::<NR, CTR_LANES>(rk, blocks))
+        {
+            apply(chunk, ks);
+        }
+    }
+    for chunk in groups.into_remainder().chunks_mut(16) {
+        let [ks] = aes_encrypt::<NR, 1>(rk, [block(counter)]);
+        counter = counter.wrapping_add(1);
+        apply(chunk, ks);
+    }
 }
 
 /// Finds an extra-field record by header id within an extra-field block.
@@ -1900,6 +1974,168 @@ mod tests {
                 }
             }
         }
+    }
+
+    // AES as first written, a byte at a time: the reference the table-driven
+    // version must match.
+    #[inline]
+    fn xtime(x: u8) -> u8 {
+        (x << 1) ^ if x & 0x80 != 0 { 0x1b } else { 0 }
+    }
+
+    fn expand_reference(key: &[u8]) -> Option<([[u8; 16]; 15], usize)> {
+        let (nk, nr) = match key.len() {
+            16 => (4usize, 10usize),
+            24 => (6usize, 12usize),
+            32 => (8usize, 14usize),
+            _ => return None,
+        };
+        let total_words = 4 * (nr + 1);
+        let mut w = [0u32; 60];
+        for (i, chunk) in key.chunks_exact(4).enumerate() {
+            w[i] = u32::from_be_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]);
+        }
+        for i in nk..total_words {
+            let mut temp = w[i - 1];
+            if i % nk == 0 {
+                temp = sub_word(temp.rotate_left(8)) ^ RCON[i / nk - 1];
+            } else if nk > 6 && i % nk == 4 {
+                temp = sub_word(temp);
+            }
+            w[i] = w[i - nk] ^ temp;
+        }
+        let mut rk = [[0u8; 16]; 15];
+        for r in 0..=nr {
+            for c in 0..4 {
+                rk[r][c * 4..c * 4 + 4].copy_from_slice(&w[r * 4 + c].to_be_bytes());
+            }
+        }
+        Some((rk, nr))
+    }
+
+    fn encrypt_reference(rk: &[[u8; 16]; 15], nr: usize, block: &[u8; 16]) -> [u8; 16] {
+        let mut s = *block;
+        for (b, &k) in s.iter_mut().zip(&rk[0]) {
+            *b ^= k;
+        }
+        for round_key in rk.iter().take(nr).skip(1) {
+            for b in &mut s {
+                *b = SBOX[usize::from(*b)];
+            }
+            s = [
+                s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12],
+                s[1], s[6], s[11],
+            ];
+            for col in s.chunks_exact_mut(4) {
+                let (s0, s1, s2, s3) = (col[0], col[1], col[2], col[3]);
+                let t = s0 ^ s1 ^ s2 ^ s3;
+                col[0] ^= t ^ xtime(s0 ^ s1);
+                col[1] ^= t ^ xtime(s1 ^ s2);
+                col[2] ^= t ^ xtime(s2 ^ s3);
+                col[3] ^= t ^ xtime(s3 ^ s0);
+            }
+            for (b, &k) in s.iter_mut().zip(round_key) {
+                *b ^= k;
+            }
+        }
+        for b in &mut s {
+            *b = SBOX[usize::from(*b)];
+        }
+        s = [
+            s[0], s[5], s[10], s[15], s[4], s[9], s[14], s[3], s[8], s[13], s[2], s[7], s[12],
+            s[1], s[6], s[11],
+        ];
+        for (b, &k) in s.iter_mut().zip(&rk[nr]) {
+            *b ^= k;
+        }
+        s
+    }
+
+    fn ctr_reference(key: &[u8], ciphertext: &[u8]) -> Option<Vec<u8>> {
+        let (rk, nr) = expand_reference(key)?;
+        let mut out = Vec::with_capacity(ciphertext.len());
+        let mut counter = [0u8; 16];
+        for chunk in ciphertext.chunks(16) {
+            for b in &mut counter {
+                *b = b.wrapping_add(1);
+                if *b != 0 {
+                    break;
+                }
+            }
+            let ks = encrypt_reference(&rk, nr, &counter);
+            for (&c, &k) in chunk.iter().zip(&ks) {
+                out.push(c ^ k);
+            }
+        }
+        Some(out)
+    }
+
+    fn unhex(s: &str) -> Vec<u8> {
+        (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn aes_matches_fips_197_and_the_bytewise_reference() {
+        let plain: [u8; 16] = unhex("00112233445566778899aabbccddeeff")
+            .try_into()
+            .unwrap();
+        for (len, want) in [
+            (16, "69c4e0d86a7b0430d8cdb78070b4c55a"),
+            (24, "dda97ca4864cdfe06eaf70a0ec0d7191"),
+            (32, "8ea2b7ca516745bfeafc49904b496089"),
+        ] {
+            let key: Vec<u8> = (0..len as u8).collect();
+            let (rk, nr) = aes_expand_key(&key).unwrap();
+            let words =
+                [0, 4, 8, 12].map(|i| u32::from_be_bytes(plain[i..i + 4].try_into().unwrap()));
+            let out = match nr {
+                10 => aes_encrypt::<10, 1>(&rk, [words]),
+                12 => aes_encrypt::<12, 1>(&rk, [words]),
+                _ => aes_encrypt::<14, 1>(&rk, [words]),
+            };
+            let got: Vec<u8> = out[0].iter().flat_map(|w| w.to_be_bytes()).collect();
+            assert_eq!(got, unhex(want), "AES-{}", len * 8);
+            let (old_rk, old_nr) = expand_reference(&key).unwrap();
+            assert_eq!(
+                encrypt_reference(&old_rk, old_nr, &plain).to_vec(),
+                unhex(want)
+            );
+        }
+    }
+
+    #[test]
+    fn ctr_matches_the_bytewise_reference() {
+        let mut x = 0x2545_f491_4f6c_dd1du64;
+        let data: Vec<u8> = (0..(1 << 20) + 4133)
+            .map(|_| {
+                x ^= x << 13;
+                x ^= x >> 7;
+                x ^= x << 17;
+                (x >> 24) as u8
+            })
+            .collect();
+        for key_len in [16, 24, 32] {
+            let key: Vec<u8> = data[..key_len].iter().map(|b| b ^ 0x5a).collect();
+            // The whole buffer crosses the counter's carries into its second
+            // and third bytes; the short ones every tail length.
+            let want = ctr_reference(&key, &data).unwrap();
+            assert_eq!(
+                decrypt_winzip_ctr(&key, &data).unwrap(),
+                want,
+                "key {key_len}"
+            );
+            for len in (0..200).chain([4095, 4096, 4097, 65_535, 65_536, 65_537]) {
+                assert_eq!(
+                    decrypt_winzip_ctr(&key, &data[..len]).unwrap(),
+                    want[..len],
+                    "key {key_len} len {len}"
+                );
+            }
+        }
+        assert!(decrypt_winzip_ctr(&[0; 20], b"x").is_none());
     }
 
     #[test]
