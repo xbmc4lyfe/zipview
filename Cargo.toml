@@ -14,7 +14,12 @@ categories = ["parser-implementations", "compression"]
 # The only dependency. ZIP's Deflate payloads are raw deflate streams, and
 # reimplementing inflate would be a genuinely bad trade: it is the one part of
 # this crate where a subtle bug is both likely and hard to find.
-flate2 = "1.1"
+#
+# Inflation runs on zlib-rs, a Rust port of zlib, rather than flate2's default
+# miniz_oxide: 2.3-2.6x faster on Apple M4/M5 cores. Unlike miniz_oxide it uses
+# `unsafe` internally, for its SIMD paths. `runtime_detection` lets it pick
+# those paths (AVX2 and the like on x86-64) on the machine it runs on.
+flate2 = { version = "1.1", default-features = false, features = ["zlib-rs", "runtime_detection"] }
 
 [dev-dependencies]
 # None. Test fixtures are built by tests/writer.rs, which writes archives byte
