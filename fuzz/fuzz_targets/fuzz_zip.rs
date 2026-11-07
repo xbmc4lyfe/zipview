@@ -19,15 +19,37 @@
 //! follows an offset to a local header and inflates. A reader that parsed
 //! headers safely but trusted the payload offset would pass an
 //! enumeration-only fuzzer.
+//!
+//! The same bytes also go through [`ZipIndex`], the reader for archives that
+//! aren't in memory, which must agree with [`ZipReader`] on everything: the
+//! entries, every entry's bytes or error, every password check. A read it
+//! asks for past the end of the input panics.
 
 use libfuzzer_sys::fuzz_target;
-use zipview::ZipReader;
+use zipview::{ZipIndex, ZipReadError, ZipReader};
 
 fuzz_target!(|data: &[u8]| {
-    let Ok(reader) = ZipReader::new(data) else {
-        // Rejecting malformed input is correct behaviour, not a finding.
-        return;
+    let read = |offset: u64, buf: &mut [u8]| -> Result<(), ZipReadError> {
+        let start = offset as usize;
+        buf.copy_from_slice(&data[start..start + buf.len()]);
+        Ok(())
     };
+    let index = ZipIndex::open(data.len() as u64, read);
+    let reader = match ZipReader::new(data) {
+        Ok(reader) => reader,
+        Err(e) => {
+            // Rejecting malformed input is correct behaviour, not a finding,
+            // as long as both readers reject it the same way.
+            assert_eq!(index.err(), Some(e));
+            return;
+        }
+    };
+    let index = index.expect("the ranged reader opens what the in-memory one does");
+    assert_eq!(
+        format!("{:?}", reader.entries()),
+        format!("{:?}", index.entries())
+    );
+    assert_eq!(reader.comment(), index.comment());
 
     // Archive-level accessors must tolerate whatever parsed.
     let _ = reader.comment();
@@ -60,7 +82,16 @@ fuzz_target!(|data: &[u8]| {
 
         // The payload path: resolves an attacker-controlled offset and
         // inflates. Errors are expected and ignored.
-        let _ = reader.read_entry(entry);
+        let bytes = reader.read_entry(entry);
+        assert_eq!(bytes, index.fetch_entry(entry, None, read));
+        assert_eq!(
+            reader.read_entry_with_password(entry, Some("password")),
+            index.fetch_entry(entry, Some("password"), read)
+        );
+        assert_eq!(
+            reader.password_check(entry),
+            index.fetch_password_check(entry, read).expect("reads succeed")
+        );
 
         // Name-based lookup must agree that an enumerated entry exists, and
         // reading by that name must not panic either.

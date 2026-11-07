@@ -20,6 +20,15 @@
 //! ask for. That is all it does. It **cannot** write an archive, extract to
 //! disk, decrypt, or touch the filesystem at all.
 //!
+//! # Archives that aren't in memory
+//!
+//! [`ZipReader`] needs the whole archive as one slice. [`ZipIndex`] reads one
+//! that is too big to load, or that comes over a network, a byte range at a
+//! time: the end of the archive and its central directory to open it, then
+//! only the bytes of the entries you read. [`ZipIndex::open`] takes a blocking
+//! `read(offset, buf)`; [`ZipIndexOpener`] does the same one step at a time,
+//! for reads that are asynchronous.
+//!
 //! # Why this exists
 //!
 //! It was written to replace the `zip` crate in a metadata tool that needed
@@ -116,6 +125,9 @@
 #![warn(missing_docs, clippy::undocumented_unsafe_blocks)]
 
 mod accel;
+mod index;
+
+pub use index::{ZipIndex, ZipIndexOpener};
 
 use std::borrow::Cow;
 
@@ -570,6 +582,11 @@ impl<'a> ZipReader<'a> {
 
     /// Parses one central directory header at `off`, returning it and the
     /// offset of the next header.
+    ///
+    /// Always inlined: with [`ZipIndex`] calling it too, the compiler stops
+    /// inlining it into [`ZipReader::new`]'s loop, which opens a 20,000-entry
+    /// directory about 10% slower.
+    #[inline(always)]
     fn parse_central_entry(data: &[u8], off: usize) -> Result<(ZipEntry, usize)> {
         let version_made_by = u16_at(data, off + 4)?;
         let flags = u16_at(data, off + 8)?;
@@ -742,24 +759,7 @@ impl<'a> ZipReader<'a> {
             self.data,
         )
         .ok()?;
-        if u32_at(self.data, local).ok()? != LOCAL_HEADER_SIG {
-            return None;
-        }
-        let local_name_len = u16_at(self.data, local + 26).ok()? as usize;
-        let local_extra_len = u16_at(self.data, local + 28).ok()? as usize;
-        let extra_start = local
-            .checked_add(LOCAL_HEADER_LEN)?
-            .checked_add(local_name_len)?;
-        let data_start = extra_start.checked_add(local_extra_len)?;
-        let local_extra = self.data.get(extra_start..data_start)?;
-        let entry_slice = self.data.get(local..)?;
-        password_check_at(
-            entry_slice,
-            usize::from(entry.flags),
-            usize::from(entry.compression),
-            local_extra,
-            data_start - local,
-        )
+        local_password_check(self.data, local, entry)
     }
 
     /// Decompresses one entry's payload.
@@ -785,76 +785,112 @@ impl<'a> ZipReader<'a> {
             entry.local_header_offset.saturating_add(self.offset_shift),
             self.data,
         )?;
-        if u32_at(self.data, local)? != LOCAL_HEADER_SIG {
-            return Err(ZipReadError::BadSignature);
-        }
-        // Only the variable-length counts are taken from the local header; the
-        // payload begins after them.
-        let local_name_len = u16_at(self.data, local + 26)? as usize;
-        let local_extra_len = u16_at(self.data, local + 28)? as usize;
+        read_local_entry(self.data, local, entry, password)
+    }
+}
 
-        let extra_start = local
-            .checked_add(LOCAL_HEADER_LEN)
-            .and_then(|v| v.checked_add(local_name_len))
-            .ok_or(ZipReadError::BadOffset)?;
-        let data_start = extra_start
-            .checked_add(local_extra_len)
-            .ok_or(ZipReadError::BadOffset)?;
-        let local_extra = self
-            .data
-            .get(extra_start..data_start)
-            .ok_or(ZipReadError::Truncated)?;
+/// The [`PasswordCheck`] of encrypted `entry`, whose local header starts at
+/// `local` in `data`. Shared by [`ZipReader`], where `data` is the whole
+/// archive, and [`ZipIndex`], where it is the bytes read from the local
+/// header on.
+fn local_password_check(data: &[u8], local: usize, entry: &ZipEntry) -> Option<PasswordCheck> {
+    if u32_at(data, local).ok()? != LOCAL_HEADER_SIG {
+        return None;
+    }
+    let local_name_len = u16_at(data, local + 26).ok()? as usize;
+    let local_extra_len = u16_at(data, local + 28).ok()? as usize;
+    let extra_start = local
+        .checked_add(LOCAL_HEADER_LEN)?
+        .checked_add(local_name_len)?;
+    let data_start = extra_start.checked_add(local_extra_len)?;
+    let local_extra = data.get(extra_start..data_start)?;
+    let entry_slice = data.get(local..)?;
+    password_check_at(
+        entry_slice,
+        usize::from(entry.flags),
+        usize::from(entry.compression),
+        local_extra,
+        data_start - local,
+    )
+}
 
-        let compressed_len =
-            usize::try_from(entry.compressed_size).map_err(|_| ZipReadError::BadOffset)?;
-        let data_end = data_start
-            .checked_add(compressed_len)
-            .ok_or(ZipReadError::BadOffset)?;
-        let payload = self
-            .data
-            .get(data_start..data_end)
-            .ok_or(ZipReadError::Truncated)?;
+/// Decrypts and decompresses `entry`, whose local header starts at `local`
+/// in `data` (see [`local_password_check`] for what `data` is). Sizes come
+/// from the central directory, never the local header: a streamed entry
+/// stores zeros there and writes the real values to a data descriptor after
+/// the payload.
+fn read_local_entry(
+    data: &[u8],
+    local: usize,
+    entry: &ZipEntry,
+    password: Option<&str>,
+) -> Result<Vec<u8>> {
+    if u32_at(data, local)? != LOCAL_HEADER_SIG {
+        return Err(ZipReadError::BadSignature);
+    }
+    // Only the variable-length counts are taken from the local header; the
+    // payload begins after them.
+    let local_name_len = u16_at(data, local + 26)? as usize;
+    let local_extra_len = u16_at(data, local + 28)? as usize;
 
-        let (decrypted_buf, method);
-        let payload_bytes: &[u8] = if entry.is_encrypted() {
-            let pw = password
-                .filter(|s| !s.is_empty())
-                .ok_or(ZipReadError::Encrypted)?;
-            if entry.compression == 99 {
-                let (strength, actual_method) = entry
-                    .aes_info
-                    .or_else(|| aes_extra(local_extra))
-                    .ok_or(ZipReadError::UnsupportedCompression(99))?;
-                decrypted_buf =
-                    decrypt_winzip_aes(pw, strength, payload, Some(entry.compressed_size))
-                        .ok_or(ZipReadError::BadPassword)?;
-                method = actual_method;
-            } else {
-                let check = if entry.flags & 0x0008 != 0 {
-                    *self.data.get(local + 11).ok_or(ZipReadError::Truncated)?
-                } else {
-                    (entry.crc32 >> 24) as u8
-                };
-                decrypted_buf =
-                    decrypt_zipcrypto(pw, check, payload).ok_or(ZipReadError::BadPassword)?;
-                method = entry.compression;
-            }
-            &decrypted_buf
+    let extra_start = local
+        .checked_add(LOCAL_HEADER_LEN)
+        .and_then(|v| v.checked_add(local_name_len))
+        .ok_or(ZipReadError::BadOffset)?;
+    let data_start = extra_start
+        .checked_add(local_extra_len)
+        .ok_or(ZipReadError::BadOffset)?;
+    let local_extra = data
+        .get(extra_start..data_start)
+        .ok_or(ZipReadError::Truncated)?;
+
+    let compressed_len =
+        usize::try_from(entry.compressed_size).map_err(|_| ZipReadError::BadOffset)?;
+    let data_end = data_start
+        .checked_add(compressed_len)
+        .ok_or(ZipReadError::BadOffset)?;
+    let payload = data
+        .get(data_start..data_end)
+        .ok_or(ZipReadError::Truncated)?;
+
+    let (decrypted_buf, method);
+    let payload_bytes: &[u8] = if entry.is_encrypted() {
+        let pw = password
+            .filter(|s| !s.is_empty())
+            .ok_or(ZipReadError::Encrypted)?;
+        if entry.compression == 99 {
+            let (strength, actual_method) = entry
+                .aes_info
+                .or_else(|| aes_extra(local_extra))
+                .ok_or(ZipReadError::UnsupportedCompression(99))?;
+            decrypted_buf = decrypt_winzip_aes(pw, strength, payload, Some(entry.compressed_size))
+                .ok_or(ZipReadError::BadPassword)?;
+            method = actual_method;
         } else {
+            let check = if entry.flags & 0x0008 != 0 {
+                *data.get(local + 11).ok_or(ZipReadError::Truncated)?
+            } else {
+                (entry.crc32 >> 24) as u8
+            };
+            decrypted_buf =
+                decrypt_zipcrypto(pw, check, payload).ok_or(ZipReadError::BadPassword)?;
             method = entry.compression;
-            payload
-        };
-
-        match method {
-            0 => {
-                if payload_bytes.len() as u64 != entry.uncompressed_size {
-                    return Err(ZipReadError::DecompressionFailed);
-                }
-                Ok(payload_bytes.to_vec())
-            }
-            8 => inflate(payload_bytes, entry.uncompressed_size),
-            other => Err(ZipReadError::UnsupportedCompression(other)),
         }
+        &decrypted_buf
+    } else {
+        method = entry.compression;
+        payload
+    };
+
+    match method {
+        0 => {
+            if payload_bytes.len() as u64 != entry.uncompressed_size {
+                return Err(ZipReadError::DecompressionFailed);
+            }
+            Ok(payload_bytes.to_vec())
+        }
+        8 => inflate(payload_bytes, entry.uncompressed_size),
+        other => Err(ZipReadError::UnsupportedCompression(other)),
     }
 }
 

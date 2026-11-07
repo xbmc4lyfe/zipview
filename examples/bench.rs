@@ -174,6 +174,17 @@ fn main() {
     case("open-20000", rounds, 3, || {
         zipview::ZipReader::new(&arc_dir).unwrap().len()
     });
+    // The same directory through byte ranges, served from memory.
+    let read = |offset: u64, buf: &mut [u8]| -> Result<(), zipview::ZipReadError> {
+        let start = offset as usize;
+        buf.copy_from_slice(&arc_dir[start..start + buf.len()]);
+        Ok(())
+    };
+    case("index-open-20000", rounds, 3, || {
+        zipview::ZipIndex::open(arc_dir.len() as u64, read)
+            .unwrap()
+            .len()
+    });
     let zip_dir = zipview::ZipReader::new(&arc_dir).unwrap();
     case("by_name-100", rounds, 3, || {
         (0..100)

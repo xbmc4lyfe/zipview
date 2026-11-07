@@ -1,7 +1,8 @@
 # zipview
 
-Read-only ZIP container reader for Rust. Opens an in-memory archive, lists its
-entries, inflates the ones you ask for. That is all it does.
+Read-only ZIP container reader for Rust. Opens an archive (in memory, or read a
+byte range at a time), lists its entries, inflates the ones you ask for. That is
+all it does.
 
 It **cannot** write an archive, extract to disk, decrypt, or touch the
 filesystem. That is the point.
@@ -15,6 +16,42 @@ for entry in archive.entries() {
 
 let xml = archive.read_to_string("docProps/core.xml")?;
 ```
+
+## Archives that aren't in memory
+
+`ZipReader` needs the whole archive as one slice. For one too big to load, or
+read over a network, `ZipIndex` reads it a byte range at a time: the end of the
+archive and its central directory to open it (one read when the directory is
+small, two for most others), then only the bytes of the entries you read.
+
+```rust
+use std::os::unix::fs::FileExt;
+
+let file = std::fs::File::open("huge.zip")?;
+let read = |offset: u64, buf: &mut [u8]| file.read_exact_at(buf, offset);
+let index = zipview::ZipIndex::open(file.metadata()?.len(), read)?;
+
+for entry in index.entries() {
+    println!("{} — {} bytes", entry.name(), entry.size());
+}
+if let Some(entry) = index.by_name("release.nfo") {
+    let nfo = index.fetch_entry(entry, None, read)?; // two reads: header, entry
+    let check = index.fetch_password_check(entry, read)?; // two small reads
+}
+```
+
+`read(offset, buf)` can be anything that fills `buf` from the archive: a file
+read by offset, HTTP range requests, pieces fetched from elsewhere. Where reads
+are asynchronous, `ZipIndexOpener` does the opening one read at a time —
+`next_read` names the bytes it needs, you `supply` them however you fetch, and
+`finish` gives the index — and `header_range`, `entry_range` and
+`password_check_range` do the same for an entry, with `read_entry` and
+`password_check` finishing from the bytes.
+
+In the tests a 50 GiB archive opens with a single 65 KB read. No read is over
+16 MiB, so a directory size that lies can't make you allocate more than that at
+once, and an entry over the 256 MiB inflate limit is refused before its bytes
+are read.
 
 ## Why
 
@@ -93,6 +130,12 @@ so a round-trip cannot pass by sharing a wrong constant.
 Beyond the usual cases, the suite sweeps **every truncation** of a valid archive
 and **flips every single byte**, asserting only that nothing panics.
 
+`ZipIndex` follows `ZipReader`'s steps over byte ranges instead of a slice, so
+the suite holds the two to the same result on every fixture (plain, ZIP64,
+stub-prefixed, ZipCrypto and AES), every truncation and every single-byte
+corruption: the same entries, comment and errors, the same bytes or error from
+every entry, the same password checks.
+
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
@@ -109,7 +152,8 @@ cargo +nightly fuzz run fuzz_zip fuzz/corpus/fuzz_zip fuzz/seeds
 
 The target both lists *and reads* every entry, because a reader that parsed
 headers safely but trusted the payload offset would pass an enumeration-only
-target.
+target. It also opens every input with `ZipIndex` and asserts it agrees with
+`ZipReader` on everything.
 
 The corpus directory comes **first** and the seeds second: libFuzzer writes
 new inputs to the first directory it is given and treats the rest as read-only.
