@@ -127,7 +127,7 @@
 mod accel;
 mod index;
 
-pub use index::{OpenStep, ZipIndex, ZipIndexOpener};
+pub use index::{ZipIndex, ZipIndexOpener};
 
 use std::borrow::Cow;
 

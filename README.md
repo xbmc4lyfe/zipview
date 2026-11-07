@@ -42,10 +42,11 @@ if let Some(entry) = index.by_name("release.nfo") {
 
 `read(offset, buf)` can be anything that fills `buf` from the archive: a file
 read by offset, HTTP range requests, pieces fetched from elsewhere. Where reads
-are asynchronous, `ZipIndexOpener` does the opening one step at a time — each
-step names the bytes it needs, and you supply them however you fetch — and
-`header_range`, `entry_range` and `password_check_range` do the same for an
-entry, with `read_entry` and `password_check` finishing from the bytes.
+are asynchronous, `ZipIndexOpener` does the opening one read at a time —
+`next_read` names the bytes it needs, you `supply` them however you fetch, and
+`finish` gives the index — and `header_range`, `entry_range` and
+`password_check_range` do the same for an entry, with `read_entry` and
+`password_check` finishing from the bytes.
 
 In the tests a 50 GiB archive opens with a single 65 KB read. No read is over
 16 MiB, so a directory size that lies can't make you allocate more than that at

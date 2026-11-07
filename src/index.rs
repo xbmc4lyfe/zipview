@@ -88,24 +88,23 @@ pub struct ZipIndex {
 
 /// Opens a [`ZipIndex`] one read at a time.
 ///
-/// Call [`step`](Self::step); while it returns [`OpenStep::Read`], read those
-/// bytes of the archive however suits (asynchronously, say) and hand them to
-/// [`supply`](Self::supply). Each step asks for bytes not yet supplied.
+/// While [`next_read`](Self::next_read) names a range, read those bytes of
+/// the archive however suits (asynchronously, say) and hand them to
+/// [`supply`](Self::supply); then [`finish`](Self::finish) gives the index.
+/// Each read asks for bytes not yet supplied. The central directory is parsed
+/// once, as its pieces arrive, and bytes already parsed are dropped, so a big
+/// directory isn't held twice.
 ///
 /// ```
-/// use zipview::{OpenStep, ZipIndexOpener};
+/// use zipview::ZipIndexOpener;
 /// # fn main() -> Result<(), zipview::ZipReadError> {
 /// # let archive: Vec<u8> = vec![0x50, 0x4b, 0x05, 0x06, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
 /// let mut opener = ZipIndexOpener::new(archive.len() as u64);
-/// let index = loop {
-///     match opener.step()? {
-///         OpenStep::Read(range) => {
-///             let bytes = &archive[range.start as usize..range.end as usize]; // or fetch(range).await
-///             opener.supply(range.start, bytes)?;
-///         }
-///         OpenStep::Done(index) => break index,
-///     }
-/// };
+/// while let Some(range) = opener.next_read()? {
+///     let bytes = &archive[range.start as usize..range.end as usize]; // or fetch(range).await
+///     opener.supply(range.start, bytes)?;
+/// }
+/// let index = opener.finish()?;
 /// # let _ = index;
 /// # Ok(())
 /// # }
@@ -115,15 +114,21 @@ pub struct ZipIndexOpener {
     len: u64,
     /// Supplied pieces of the archive, at their offsets.
     held: Vec<(u64, Vec<u8>)>,
+    /// The walk over the central directory, once its start is known.
+    walk: Option<Walk>,
 }
 
-/// What [`ZipIndexOpener::step`] wants next.
+/// Where the walk over the central directory has got to, kept between reads
+/// so each header is parsed once.
 #[derive(Debug, Clone)]
-pub enum OpenStep {
-    /// These bytes of the archive, for [`ZipIndexOpener::supply`].
-    Read(Range<u64>),
-    /// The directory, read.
-    Done(ZipIndex),
+struct Walk {
+    comment: Vec<u8>,
+    offset_shift: u64,
+    eocd: u64,
+    /// Headers still to read, as the end record counts them.
+    remaining: u64,
+    cursor: u64,
+    entries: Vec<ZipEntry>,
 }
 
 /// Why a step stopped: bytes it needs, or a reason the archive can't open.
@@ -146,16 +151,34 @@ impl ZipIndexOpener {
         Self {
             len: archive_len,
             held: Vec::new(),
+            walk: None,
         }
     }
 
-    /// The bytes needed next, or the index once everything it needs has been
-    /// supplied. `Err` when the archive can't be opened, with the same error
-    /// [`ZipReader::new`] gives for it.
-    pub fn step(&self) -> Result<OpenStep> {
-        match self.open() {
-            Ok(index) => Ok(OpenStep::Done(index)),
-            Err(Halt::Read(range)) => Ok(OpenStep::Read(range)),
+    /// The bytes to read next, or `None` once everything is in. `Err` when
+    /// the archive can't be opened, with the error [`ZipReader::new`] gives
+    /// for it.
+    pub fn next_read(&mut self) -> Result<Option<Range<u64>>> {
+        let mut walk = match self.walk.take() {
+            Some(walk) => walk,
+            None => match self.locate() {
+                Ok(walk) => walk,
+                Err(Halt::Read(range)) => return Ok(Some(range)),
+                Err(Halt::Fail(e)) => return Err(e),
+            },
+        };
+        let step = self.walk(&mut walk);
+        let cursor = walk.cursor;
+        self.walk = Some(walk);
+        match step {
+            Ok(()) => {
+                self.held = Vec::new();
+                Ok(None)
+            }
+            Err(Halt::Read(range)) => {
+                self.forget_before(cursor);
+                Ok(Some(range))
+            }
             Err(Halt::Fail(e)) => Err(e),
         }
     }
@@ -185,6 +208,36 @@ impl ZipIndexOpener {
         Ok(())
     }
 
+    /// The index, once [`next_read`](Self::next_read) has nothing more to
+    /// ask for. `Truncated` if it still needs bytes.
+    pub fn finish(mut self) -> Result<ZipIndex> {
+        if self.next_read()?.is_some() {
+            return Err(ZipReadError::Truncated);
+        }
+        let walk = self.walk.ok_or(ZipReadError::Truncated)?;
+        Ok(ZipIndex {
+            len: self.len,
+            entries: walk.entries,
+            comment: walk.comment,
+            offset_shift: walk.offset_shift,
+        })
+    }
+
+    /// Drops supplied bytes before `cursor`: the walk never reads behind it.
+    fn forget_before(&mut self, cursor: u64) {
+        self.held.retain_mut(|(start, piece)| {
+            let end = *start + piece.len() as u64;
+            if end <= cursor {
+                return false;
+            }
+            if *start < cursor {
+                piece.drain(..(cursor - *start) as usize);
+                *start = cursor;
+            }
+            true
+        });
+    }
+
     /// `n` bytes at `at`, if one supplied piece holds them all.
     fn held(&self, at: u64, n: u64) -> Option<&[u8]> {
         let end = at.checked_add(n)?;
@@ -195,13 +248,28 @@ impl ZipIndexOpener {
         })
     }
 
-    /// `n` bytes at `at`, or a read of exactly those.
+    /// `n` bytes at `at`, or a read of those not yet supplied.
     fn need(&self, at: u64, n: u64) -> Step<&[u8]> {
-        self.held(at, n).ok_or(Halt::Read(at..at + n))
+        self.held(at, n)
+            .ok_or_else(|| Halt::Read(self.unheld(at, at + n)..at + n))
     }
 
-    /// Follows [`ZipReader::new`] over the supplied pieces.
-    fn open(&self) -> Step<ZipIndex> {
+    /// Where a read for `at..end` starts: past the end of a supplied piece
+    /// that covers its beginning, so a caller who supplied part of a read is
+    /// asked for the rest rather than all of it again.
+    fn unheld(&self, at: u64, end: u64) -> u64 {
+        self.held
+            .iter()
+            .filter(|(start, _)| *start <= at)
+            .map(|(start, piece)| start + piece.len() as u64)
+            .filter(|&piece_end| piece_end > at && piece_end < end)
+            .max()
+            .unwrap_or(at)
+    }
+
+    /// Follows [`ZipReader::new`] over the supplied pieces as far as where
+    /// the central directory starts.
+    fn locate(&self) -> Step<Walk> {
         let len = self.len;
         if len < EOCD_LEN as u64 {
             return Err(ZipReadError::NotAZip.into());
@@ -237,31 +305,40 @@ impl ZipIndexOpener {
         }
 
         let (cd_start, offset_shift) = self.locate_central_directory(eocd, cd_size, cd_offset)?;
+        Ok(Walk {
+            comment,
+            offset_shift,
+            eocd,
+            remaining: entry_count,
+            cursor: cd_start,
+            entries: Vec::new(),
+        })
+    }
 
-        let mut entries = Vec::new();
-        let mut cursor = cd_start;
-        for _ in 0..entry_count {
-            if u32_at(self.need_directory(cursor, 4, eocd)?, 0)? != CENTRAL_HEADER_SIG {
+    /// Parses central headers from where `walk` left off, as
+    /// [`ZipReader::new`]'s loop does, until the count runs out, a header
+    /// signature is missing, or the next header isn't supplied yet.
+    fn walk(&self, walk: &mut Walk) -> Step<()> {
+        let eocd = walk.eocd;
+        while walk.remaining > 0 {
+            if u32_at(self.need_directory(walk.cursor, 4, eocd)?, 0)? != CENTRAL_HEADER_SIG {
+                walk.remaining = 0;
                 break;
             }
-            let fixed = self.need_directory(cursor, CENTRAL_HEADER_LEN as u64, eocd)?;
+            let fixed = self.need_directory(walk.cursor, CENTRAL_HEADER_LEN as u64, eocd)?;
             let name_len = u64::from(u16_at(fixed, 28)?);
             let extra_len = u64::from(u16_at(fixed, 30)?);
             let header = CENTRAL_HEADER_LEN as u64 + name_len + extra_len;
-            let bytes = self.need_directory(cursor, header, eocd)?;
+            let bytes = self.need_directory(walk.cursor, header, eocd)?;
             let (entry, next) = ZipReader::parse_central_entry(bytes, 0)?;
-            entries.push(entry);
-            cursor = cursor
+            walk.entries.push(entry);
+            walk.cursor = walk
+                .cursor
                 .checked_add(next as u64)
                 .ok_or(ZipReadError::Truncated)?;
+            walk.remaining -= 1;
         }
-
-        Ok(ZipIndex {
-            len,
-            entries,
-            comment,
-            offset_shift,
-        })
+        Ok(())
     }
 
     /// As `ZipReader::read_zip64`: the ZIP64 counts, or `None` on any
@@ -334,7 +411,8 @@ impl ZipIndexOpener {
                     .min(eocd.saturating_sub(at))
                     .max(CENTRAL_HEADER_LEN as u64)
                     .min(DIRECTORY_READ);
-                Err(Halt::Read(at..at.saturating_add(want).min(self.len)))
+                let end = at.saturating_add(want).min(self.len);
+                Err(Halt::Read(self.unheld(at, end)..end))
             }
         }
     }
@@ -350,14 +428,7 @@ impl ZipIndexOpener {
         if let Some(bytes) = self.held(at, n) {
             return Ok(bytes);
         }
-        // Continue the piece `at` starts in, if there is one.
-        let from = self
-            .held
-            .iter()
-            .filter(|(start, _)| *start <= at)
-            .map(|(start, piece)| start + piece.len() as u64)
-            .find(|&piece_end| piece_end > at && piece_end < end)
-            .unwrap_or(at);
+        let from = self.unheld(at, end);
         // Up to the end record in reads of at most DIRECTORY_READ, or a
         // little past it for a directory whose size field undersells it.
         let chunk = eocd.saturating_sub(from).clamp(64 * 1024, DIRECTORY_READ);
@@ -379,16 +450,12 @@ impl ZipIndex {
         mut read: impl FnMut(u64, &mut [u8]) -> std::result::Result<(), E>,
     ) -> std::result::Result<Self, E> {
         let mut opener = ZipIndexOpener::new(archive_len);
-        loop {
-            match opener.step()? {
-                OpenStep::Read(range) => {
-                    let mut buf = vec![0; (range.end - range.start) as usize];
-                    read(range.start, &mut buf)?;
-                    opener.supply(range.start, &buf)?;
-                }
-                OpenStep::Done(index) => return Ok(index),
-            }
+        while let Some(range) = opener.next_read()? {
+            let mut buf = vec![0; (range.end - range.start) as usize];
+            read(range.start, &mut buf)?;
+            opener.supply(range.start, &buf)?;
         }
+        Ok(opener.finish()?)
     }
 
     /// The archive's length, as given when opening.
@@ -588,5 +655,86 @@ fn local_data_start(header: &[u8]) -> Result<u64> {
 impl From<ZipReadError> for std::io::Error {
     fn from(e: ZipReadError) -> Self {
         std::io::Error::new(std::io::ErrorKind::InvalidData, e)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// An archive of `n` empty stored entries named by `name`.
+    fn archive(n: usize, name: impl Fn(usize) -> String) -> Vec<u8> {
+        let mut out = Vec::new();
+        let mut central = Vec::new();
+        for i in 0..n {
+            let name = name(i);
+            let offset = out.len() as u32;
+            out.extend_from_slice(&LOCAL_HEADER_SIG.to_le_bytes());
+            out.extend_from_slice(&[20, 0, 0, 0, 0, 0]); // needed, flags, method
+            out.extend_from_slice(&[0; 16]); // time, date, crc, sizes
+            out.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            out.extend_from_slice(&[0, 0]); // extra
+            out.extend_from_slice(name.as_bytes());
+            central.extend_from_slice(&CENTRAL_HEADER_SIG.to_le_bytes());
+            central.extend_from_slice(&[20, 0, 20, 0, 0, 0, 0, 0]); // made by, needed, flags, method
+            central.extend_from_slice(&[0; 16]); // time, date, crc, sizes
+            central.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            central.extend_from_slice(&[0; 12]); // extra, comment, disk, attributes
+            central.extend_from_slice(&offset.to_le_bytes());
+            central.extend_from_slice(name.as_bytes());
+        }
+        let cd_offset = out.len() as u32;
+        out.extend_from_slice(&central);
+        out.extend_from_slice(&EOCD_SIG.to_le_bytes());
+        out.extend_from_slice(&[0; 4]);
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        out.extend_from_slice(&(n as u16).to_le_bytes());
+        out.extend_from_slice(&(central.len() as u32).to_le_bytes());
+        out.extend_from_slice(&cd_offset.to_le_bytes());
+        out.extend_from_slice(&[0, 0]);
+        out
+    }
+
+    #[test]
+    fn a_big_directory_is_parsed_once_and_not_held_twice() {
+        // 60,000 entries with 300-byte names: about 21 MB of directory. Only
+        // the first 64 KiB of each read is supplied, so it arrives in over
+        // 300 pieces; parsing it again on every one would take minutes.
+        let data = archive(60_000, |i| format!("{i:0>300}"));
+        let mut opener = ZipIndexOpener::new(data.len() as u64);
+        let (mut reads, mut parsed) = (0, 0);
+        while let Some(range) = opener.next_read().expect("next read") {
+            reads += 1;
+            if let Some(walk) = &opener.walk {
+                assert!(walk.entries.len() >= parsed);
+                parsed = walk.entries.len();
+                // What's held is the tail and less than one header of the
+                // directory: the rest is parsed and dropped.
+                let held: u64 = opener.held.iter().map(|(_, p)| p.len() as u64).sum();
+                assert!(held <= TAIL_LEN + 1024, "{held} bytes held");
+            }
+            let end = range.end.min(range.start + 65_536);
+            let bytes = &data[range.start as usize..end as usize];
+            opener.supply(range.start, bytes).expect("supply");
+        }
+        assert!(reads > 300, "{reads} reads");
+        let index = opener.finish().expect("finish");
+        assert_eq!(index.len(), 60_000);
+        assert_eq!(index.entries()[59_999].name(), format!("{:0>300}", 59_999));
+        let memory = ZipReader::new(&data).expect("parse");
+        assert_eq!(
+            format!("{:?}", memory.entries()),
+            format!("{:?}", index.entries())
+        );
+    }
+
+    #[test]
+    fn finishing_early_is_an_error() {
+        let data = archive(3, |i| format!("f{i}"));
+        let opener = ZipIndexOpener::new(data.len() as u64);
+        assert_eq!(
+            opener.finish().map(|i| i.len()),
+            Err(ZipReadError::Truncated)
+        );
     }
 }

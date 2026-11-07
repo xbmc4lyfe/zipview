@@ -506,7 +506,7 @@ fn an_unsupported_method_still_enumerates() {
 // ---------------------------------------------------------------------------
 
 use std::cell::RefCell;
-use zipview::{OpenStep, PasswordCheck, ZipIndex, ZipIndexOpener};
+use zipview::{PasswordCheck, ZipIndex, ZipIndexOpener};
 
 /// An archive served a range at a time, recording each read. A read past the
 /// end panics, failing the test.
@@ -742,23 +742,18 @@ fn the_opener_asks_only_for_bytes_it_lacks() {
     let data = build(&entries, "");
     let mut opener = ZipIndexOpener::new(data.len() as u64);
     let mut asked: Vec<std::ops::Range<u64>> = Vec::new();
-    let index = loop {
-        match opener.step().expect("step") {
-            OpenStep::Read(range) => {
-                assert!(range.start < range.end && range.end <= data.len() as u64);
-                assert!(!asked.contains(&range), "asked twice for {range:?}");
-                let bytes = &data[range.start as usize..range.end as usize];
-                opener.supply(range.start, bytes).expect("supply");
-                asked.push(range);
-            }
-            OpenStep::Done(index) => break index,
-        }
-    };
-    assert_eq!(index.len(), 3000);
+    while let Some(range) = opener.next_read().expect("next read") {
+        assert!(range.start < range.end && range.end <= data.len() as u64);
+        assert!(!asked.contains(&range), "asked twice for {range:?}");
+        let bytes = &data[range.start as usize..range.end as usize];
+        opener.supply(range.start, bytes).expect("supply");
+        asked.push(range);
+    }
     assert_eq!(
         opener.supply(data.len() as u64 - 1, b"ab"),
         Err(ZipReadError::BadOffset)
     );
+    assert_eq!(opener.finish().expect("finish").len(), 3000);
 }
 
 /// An archive mostly of zeros it never stores: `pieces` are its real bytes
